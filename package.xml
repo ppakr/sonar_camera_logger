@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>sonar_camera_logger</name>
+  <version>0.0.0</version>
+  <description>WaterLinked 3D Sonar driver and camera logger</description>
+  <maintainer email="akira.techap@gmail.com">aki</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- ROS 2 -->
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>cv_bridge</depend>
+  <depend>opencv2</depend>
+
+  <!-- System libraries (resolved outside ament) -->
+  <!-- sudo apt install libprotobuf-dev protobuf-compiler libsnappy-dev libcurl4-openssl-dev -->
+  <build_depend>libprotobuf-dev</build_depend>
+  <build_depend>protobuf-compiler</build_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

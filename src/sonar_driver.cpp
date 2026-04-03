@@ -1,12 +1,17 @@
 /**
  * WaterLinked 3D Sonar Driver - ROS 2 C++ implementation
+ * Uses rclcpp::Waitable to integrate the UDP socket into the ROS2 executor.
  *
  * Wire protocol: RIP2 = [magic 4B][total_len 4B LE][snappy(protobuf)][crc32 4B
  * LE] HTTP API used to enable acoustics and configure UDP multicast on
  * startup/shutdown.
  */
 
+#include <rcl/wait.h>
+#include <rclcpp/guard_condition.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rclcpp/waitable.hpp>
+
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <sensor_msgs/msg/point_field.hpp>
@@ -14,6 +19,7 @@
 #include <arpa/inet.h>
 #include <endian.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -21,16 +27,17 @@
 #include <snappy.h>
 #include <zlib.h>
 
-#include <google/protobuf/any.pb.h>
-// Generated from proto/WaterLinkedSonarIntegrationProtocol.proto
 #include "WaterLinkedSonarIntegrationProtocol.pb.h"
+#include <google/protobuf/any.pb.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -38,7 +45,8 @@
 
 namespace proto = waterlinked::sonar::protocol;
 
-// ── constants ────────────────────────────────────────────────────────────────
+// ── constants
+// ─────────────────────────────────────────────────────────────────
 static constexpr int UDP_MAX_DATAGRAM_SIZE = 65507;
 static constexpr char DEFAULT_MCAST_GRP[] = "224.0.0.96";
 static constexpr int DEFAULT_MCAST_PORT = 4747;
@@ -83,7 +91,6 @@ make_field(const std::string &name, uint32_t offset, uint8_t datatype) {
   return f;
 }
 
-// XYZ-only cloud (12 bytes/point)
 static sensor_msgs::msg::PointCloud2
 build_xyz_cloud(const builtin_interfaces::msg::Time &stamp,
                 const std::string &frame_id,
@@ -107,7 +114,6 @@ build_xyz_cloud(const builtin_interfaces::msg::Time &stamp,
   return msg;
 }
 
-// XYZI cloud (13 bytes/point, packed)
 #pragma pack(push, 1)
 struct PointXYZI {
   float x, y, z;
@@ -131,13 +137,130 @@ build_xyzi_cloud(const builtin_interfaces::msg::Time &stamp,
       make_field("intensity", 12, sensor_msgs::msg::PointField::UINT8),
   };
   msg.is_bigendian = false;
-  msg.point_step = static_cast<uint32_t>(sizeof(PointXYZI)); // 13
+  msg.point_step = static_cast<uint32_t>(sizeof(PointXYZI));
   msg.row_step = msg.point_step * msg.width;
   msg.is_dense = true;
   msg.data.resize(msg.row_step);
   std::memcpy(msg.data.data(), pts.data(), msg.row_step);
   return msg;
 }
+
+// ── UdpWaitable
+// ───────────────────────────────────────────────────────────────
+//
+// This class bridges a raw UDP socket into the ROS2 executor's wait loop.
+//
+// It owns:
+//   • The UDP socket file descriptor
+//   • A GuardCondition (the ROS2 object that can be put in a wait set)
+//   • A tiny watcher thread (only does select() + trigger())
+//
+// The executor owns the lifecycle of execute() — it is always called on the
+// same thread as spin(), so the SonarDriver's maps, buffers, and publishers
+// need no mutex protection.
+class UdpWaitable : public rclcpp::Waitable {
+public:
+  // Callback type: called with (raw_bytes, length) for every received packet.
+  // Runs on the executor thread (i.e. the spin() thread).
+  using PacketCallback = std::function<void(const uint8_t *, ssize_t)>;
+
+  UdpWaitable(rclcpp::Context::SharedPtr context, int sock, PacketCallback cb)
+      : guard_condition_(context), sock_(sock), callback_(std::move(cb)) {
+    running_ = true;
+    watcher_ = std::thread(&UdpWaitable::watch_loop, this);
+  }
+
+  ~UdpWaitable() override {
+    // Signal the watcher to stop and wait for it.
+    // The watcher only blocks in select() with a 50ms timeout,
+    // so this join completes quickly.
+    running_ = false;
+    if (watcher_.joinable())
+      watcher_.join();
+  }
+
+  // ── rclcpp::Waitable interface ────────────────────────────────────────────
+
+  // Step 1: Tell the executor how many guard conditions we need in the wait
+  // set.
+  size_t get_number_of_ready_guard_conditions() override { return 1; }
+
+  // Step 2: The executor calls this to register our guard condition into its
+  // internal wait set before calling rcl_wait(). gc_index_ is filled in by
+  // rcl_wait_set_add_guard_condition so we know which slot is ours later.
+  void add_to_wait_set(rcl_wait_set_t &wait_set) override {
+    // rcl API takes a pointer, so pass &wait_set even though we receive a ref
+    rcl_ret_t ret = rcl_wait_set_add_guard_condition(
+        &wait_set, &guard_condition_.get_rcl_guard_condition(), &gc_index_);
+    if (ret != RCL_RET_OK) {
+      throw std::runtime_error(
+          "UdpWaitable: failed to add guard condition to wait set");
+    }
+  }
+
+  // Step 3: After rcl_wait() returns, the executor calls this to check if WE
+  // were the reason it woke up. rcl_wait() sets triggered slots to non-null
+  // and clears untriggered slots to null.
+  bool is_ready(const rcl_wait_set_t &wait_set) override {
+    return wait_set.guard_conditions[gc_index_] != nullptr;
+  }
+
+  // Step 4a: take_data() is called (while holding the entity lock) to extract
+  // the data before execute(). We drain the socket here so that execute()
+  // receives a ready-made list of raw packets — no socket reads in execute().
+  std::shared_ptr<void> take_data() override {
+    // Read all UDP packets currently available (MSG_DONTWAIT = non-blocking).
+    // By the time take_data() is called, select() already confirmed data is
+    // available, so at least one recvfrom() will succeed immediately.
+    auto packets = std::make_shared<std::vector<std::vector<uint8_t>>>();
+    std::vector<uint8_t> buf(UDP_MAX_DATAGRAM_SIZE);
+    while (true) {
+      ssize_t n = recvfrom(sock_, buf.data(), buf.size(), MSG_DONTWAIT, nullptr,
+                           nullptr);
+      if (n < 0)
+        break; // EAGAIN/EWOULDBLOCK: no more packets right now
+      packets->emplace_back(buf.data(), buf.data() + n);
+    }
+    return packets;
+  }
+
+  // Step 4b: execute() is called on the spin() thread with the data returned
+  // by take_data(). This is where we invoke the node's packet processing.
+  void execute(const std::shared_ptr<void> &data) override {
+    auto packets =
+        std::static_pointer_cast<std::vector<std::vector<uint8_t>>>(data);
+    if (!packets)
+      return;
+    for (const auto &pkt : *packets) {
+      callback_(pkt.data(), static_cast<ssize_t>(pkt.size()));
+    }
+  }
+
+private:
+  // The watcher thread: extremely simple — just watches the socket and pokes
+  // the executor when data is available. Does NO parsing, NO publishing,
+  // NO shared state access beyond the atomic running_ flag.
+  void watch_loop() {
+    while (running_) {
+      fd_set fds;
+      FD_ZERO(&fds);
+      FD_SET(sock_, &fds);
+      // 50ms timeout so we re-check running_ and can exit cleanly.
+      timeval tv{0, 50'000};
+      if (select(sock_ + 1, &fds, nullptr, nullptr, &tv) > 0) {
+        // A packet arrived — wake the executor.
+        guard_condition_.trigger();
+      }
+    }
+  }
+
+  rclcpp::GuardCondition guard_condition_;
+  int sock_;
+  PacketCallback callback_;
+  std::atomic<bool> running_{false};
+  std::thread watcher_;
+  size_t gc_index_{0};
+};
 
 // ── SonarDriver node
 // ──────────────────────────────────────────────────────────
@@ -163,19 +286,28 @@ public:
       RCLCPP_WARN(get_logger(), "Failed to configure UDP multicast via HTTP");
 
     sock_ = open_multicast_socket();
-    running_ = true;
-    thread_ = std::thread(&SonarDriver::socket_loop, this);
+    waitable_ = std::make_shared<UdpWaitable>(
+        get_node_base_interface()->get_context(), sock_,
+        [this](const uint8_t *data, ssize_t n) { on_packet(data, n); });
+
+    // Register the waitable with the node's default callback group.
+    // The executor will now include it in the wait set on every spin cycle.
+    get_node_waitables_interface()->add_waitable(
+        waitable_, get_node_base_interface()->get_default_callback_group());
   }
 
-  ~SonarDriver() {
-    running_ = false;
+  ~SonarDriver() override {
+    // 1. Destroy the waitable first — this joins the watcher thread,
+    //    which may still be inside select(). The watcher thread only
+    //    holds sock_ as a read-only fd, so it's safe to join before close().
+    waitable_.reset();
+
+    // 2. Now safe to close the socket.
     if (sock_ >= 0) {
-      shutdown(sock_, SHUT_RDWR);
       close(sock_);
       sock_ = -1;
     }
-    if (thread_.joinable())
-      thread_.join();
+
     http_post_json("http://" + sonar_ip_ +
                        "/api/v1/integration/acoustics/enabled",
                    "false");
@@ -185,8 +317,10 @@ private:
   std::string sonar_ip_;
   std::string frame_id_;
   int sock_ = -1;
-  std::atomic<bool> running_{false};
-  std::thread thread_;
+
+  // Declare waitable_ AFTER sock_ so its destructor runs FIRST
+  // (C++ destroys members in reverse declaration order).
+  std::shared_ptr<UdpWaitable> waitable_;
 
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pub_cloud_xyzi_;
@@ -194,6 +328,7 @@ private:
 
   std::map<uint32_t, proto::RangeImage> range_buf_;
   std::map<uint32_t, proto::BitmapImageGreyscale8> strength_buf_;
+  std::vector<uint8_t> proto_bytes_; // reused per call
   static constexpr int MAX_BUF = 50;
 
   // ── socket ────────────────────────────────────────────────────────────────
@@ -221,9 +356,36 @@ private:
     return s;
   }
 
-  // ── RIP packet parser ─────────────────────────────────────────────────────
-  // Returns false and logs if the packet is malformed or the CRC fails.
-  // On success, proto_out contains the raw (decompressed) protobuf bytes.
+  // ── called by UdpWaitable::execute() on the spin() thread ────────────────
+  void on_packet(const uint8_t *data, ssize_t n) {
+    if (!parse_rip_packet(data, n, proto_bytes_))
+      return;
+
+    proto::Packet pkt;
+    if (!pkt.ParseFromArray(proto_bytes_.data(),
+                            static_cast<int>(proto_bytes_.size()))) {
+      RCLCPP_WARN(get_logger(), "Failed to parse protobuf Packet");
+      return;
+    }
+
+    const auto &any = pkt.msg();
+    proto::RangeImage range_msg;
+    proto::BitmapImageGreyscale8 bitmap_msg;
+
+    if (any.UnpackTo(&range_msg)) {
+      handle_range_image(range_msg);
+    } else if (any.UnpackTo(&bitmap_msg)) {
+      handle_strength_image(bitmap_msg);
+    } else {
+      RCLCPP_DEBUG(get_logger(), "Unknown msg type: %s",
+                   any.type_url().c_str());
+      return;
+    }
+
+    buffer_handler();
+  }
+
+  // ── RIP2 packet parser ────────────────────────────────────────────────────
   bool parse_rip_packet(const uint8_t *data, ssize_t n,
                         std::vector<uint8_t> &proto_out) {
     if (n < static_cast<ssize_t>(HEADER_LEN + CHECKSUM_LEN))
@@ -243,7 +405,6 @@ private:
     if (total_len < HEADER_LEN + CHECKSUM_LEN)
       return false;
 
-    // CRC32 covers everything up to (but not including) the trailing checksum
     uint32_t crc_calc = static_cast<uint32_t>(
         crc32(crc32(0L, Z_NULL, 0), data, total_len - CHECKSUM_LEN));
     uint32_t crc_recv;
@@ -273,53 +434,9 @@ private:
         return false;
       }
     } else {
-      // RIP1: payload is raw protobuf
       proto_out.assign(payload, payload + payload_len);
     }
     return true;
-  }
-
-  // ── socket loop (runs in background thread) ───────────────────────────────
-  void socket_loop() {
-    std::vector<uint8_t> recv_buf(UDP_MAX_DATAGRAM_SIZE);
-    std::vector<uint8_t> proto_bytes;
-
-    while (running_) {
-      ssize_t n = recvfrom(sock_, recv_buf.data(), recv_buf.size(), 0, nullptr,
-                           nullptr);
-      if (n < 0) {
-        if (running_)
-          RCLCPP_WARN(get_logger(), "recvfrom error: %s", strerror(errno));
-        break;
-      }
-
-      if (!parse_rip_packet(recv_buf.data(), n, proto_bytes))
-        continue;
-
-      proto::Packet pkt;
-      if (!pkt.ParseFromArray(proto_bytes.data(),
-                              static_cast<int>(proto_bytes.size()))) {
-        RCLCPP_WARN(get_logger(), "Failed to parse protobuf Packet");
-        continue;
-      }
-
-      const auto &any = pkt.msg();
-
-      proto::RangeImage range_msg;
-      proto::BitmapImageGreyscale8 bitmap_msg;
-
-      if (any.UnpackTo(&range_msg)) {
-        handle_range_image(range_msg);
-      } else if (any.UnpackTo(&bitmap_msg)) {
-        handle_strength_image(bitmap_msg);
-      } else {
-        RCLCPP_DEBUG(get_logger(), "Unknown msg type: %s",
-                     any.type_url().c_str());
-        continue;
-      }
-
-      buffer_handler();
-    }
   }
 
   // ── timestamp conversion ──────────────────────────────────────────────────
@@ -334,10 +451,9 @@ private:
   // ── message handlers ──────────────────────────────────────────────────────
   void handle_range_image(const proto::RangeImage &msg) {
     range_buf_[msg.header().sequence_id()] = msg;
-
-    auto pts = range_image_to_xyz(msg);
     auto stamp = to_ros_time(msg.header().timestamp());
-    pub_cloud_->publish(build_xyz_cloud(stamp, frame_id_, pts));
+    pub_cloud_->publish(
+        build_xyz_cloud(stamp, frame_id_, range_image_to_xyz(msg)));
   }
 
   void handle_strength_image(const proto::BitmapImageGreyscale8 &msg) {
@@ -355,7 +471,6 @@ private:
 
     const auto &raw = msg.image_pixel_data();
     img.data.resize(raw.size());
-    // Flip vertically to match coordinate convention
     for (uint32_t row = 0; row < msg.height(); ++row) {
       uint32_t src_row = msg.height() - 1 - row;
       std::memcpy(img.data.data() + row * msg.width(),
@@ -366,7 +481,7 @@ private:
     pub_img_->publish(img);
   }
 
-  // ── buffer handler: match range + strength by sequence_id ─────────────────
+  // ── buffer handler ────────────────────────────────────────────────────────
   void buffer_handler() {
     std::vector<uint32_t> common;
     for (auto &[id, _] : range_buf_) {
@@ -378,7 +493,9 @@ private:
     for (uint32_t id : common) {
       auto r = range_buf_.extract(id);
       auto s = strength_buf_.extract(id);
-      publish_xyzi_cloud(r.mapped(), s.mapped());
+      auto pts = range_image_to_xyzi(r.mapped(), s.mapped());
+      auto stamp = to_ros_time(r.mapped().header().timestamp());
+      pub_cloud_xyzi_->publish(build_xyzi_cloud(stamp, frame_id_, pts));
     }
 
     auto evict = [&](auto &buf, const char *name) {
@@ -394,25 +511,16 @@ private:
     evict(strength_buf_, "Strength");
   }
 
-  void publish_xyzi_cloud(const proto::RangeImage &r,
-                          const proto::BitmapImageGreyscale8 &s) {
-    auto pts = range_image_to_xyzi(r, s);
-    auto stamp = to_ros_time(r.header().timestamp());
-    pub_cloud_xyzi_->publish(build_xyzi_cloud(stamp, frame_id_, pts));
-  }
-
   // ── geometry ──────────────────────────────────────────────────────────────
   static std::vector<std::array<float, 3>>
   range_image_to_xyz(const proto::RangeImage &img) {
-    uint32_t w = img.width();
-    uint32_t h = img.height();
+    uint32_t w = img.width(), h = img.height();
     float fov_h = img.fov_horizontal() * static_cast<float>(M_PI) / 180.0f;
     float fov_v = img.fov_vertical() * static_cast<float>(M_PI) / 180.0f;
     float scale = img.image_pixel_scale();
 
     std::vector<std::array<float, 3>> pts;
     pts.reserve(w * h);
-
     for (uint32_t px = 0; px < w; ++px) {
       for (uint32_t py = 0; py < h; ++py) {
         uint32_t val = img.image_pixel_data(static_cast<int>(py * w + px));
@@ -430,30 +538,27 @@ private:
   }
 
   static std::vector<PointXYZI>
-  range_image_to_xyzi(const proto::RangeImage &range_img,
-                      const proto::BitmapImageGreyscale8 &strength_img) {
-    uint32_t w = range_img.width();
-    uint32_t h = range_img.height();
-    float fov_h =
-        range_img.fov_horizontal() * static_cast<float>(M_PI) / 180.0f;
-    float fov_v = range_img.fov_vertical() * static_cast<float>(M_PI) / 180.0f;
-    float scale = range_img.image_pixel_scale();
-    const auto &raw_strength = strength_img.image_pixel_data();
+  range_image_to_xyzi(const proto::RangeImage &r,
+                      const proto::BitmapImageGreyscale8 &s) {
+    uint32_t w = r.width(), h = r.height();
+    float fov_h = r.fov_horizontal() * static_cast<float>(M_PI) / 180.0f;
+    float fov_v = r.fov_vertical() * static_cast<float>(M_PI) / 180.0f;
+    float scale = r.image_pixel_scale();
+    const auto &raw_s = s.image_pixel_data();
 
     std::vector<PointXYZI> pts;
     pts.reserve(w * h);
-
     for (uint32_t px = 0; px < w; ++px) {
       for (uint32_t py = 0; py < h; ++py) {
         int idx = static_cast<int>(py * w + px);
-        uint32_t val = range_img.image_pixel_data(idx);
+        uint32_t val = r.image_pixel_data(idx);
         if (val == 0)
           continue;
         float dist = val * scale;
         float yaw = (static_cast<float>(px) / (w - 1)) * fov_h - fov_h / 2.0f;
         float pitch = (static_cast<float>(py) / (h - 1)) * fov_v - fov_v / 2.0f;
-        uint8_t intensity = (idx < static_cast<int>(raw_strength.size()))
-                                ? static_cast<uint8_t>(raw_strength[idx])
+        uint8_t intensity = (idx < static_cast<int>(raw_s.size()))
+                                ? static_cast<uint8_t>(raw_s[idx])
                                 : 0u;
         pts.push_back({dist * std::cos(pitch) * std::cos(yaw),
                        dist * std::cos(pitch) * std::sin(yaw),
@@ -468,8 +573,7 @@ private:
 // ──────────────────────────────────────────────────────────────────────
 int main(int argc, char *argv[]) {
   rclcpp::init(argc, argv);
-  auto node = std::make_shared<SonarDriver>();
-  rclcpp::spin(node);
+  rclcpp::spin(std::make_shared<SonarDriver>());
   rclcpp::shutdown();
   return 0;
 }

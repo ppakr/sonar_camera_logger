@@ -3,12 +3,11 @@
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/image.hpp>
-#include <sensor_msgs/msg/camera_info.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
+#include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <cv_bridge/cv_bridge.hpp>
 #include <opencv2/opencv.hpp>
@@ -19,60 +18,71 @@ class ArucoDistanceNode : public rclcpp::Node
 public:
   ArucoDistanceNode() : Node("aruco_distance_node")
   {
-    declare_parameter("marker_size", 0.05);   // physical marker side length in metres
-    declare_parameter("dictionary_id", 10);   // cv::aruco dict ID; 10 = DICT_6X6_250
-    declare_parameter("image_topic", "/camera/image_raw");
-    declare_parameter("camera_info_topic", "/camera/camera_info");
-    declare_parameter("camera_frame", "camera_optical_frame");
+    declare_parameter("camera_index",   0);
+    declare_parameter("capture_fps",    30.0);
+    declare_parameter("marker_size",    0.05);
+    declare_parameter("dictionary_id",  10);
+    declare_parameter("camera_frame",   "camera_optical_frame");
+    declare_parameter("camera_fx",      600.0);
+    declare_parameter("camera_fy",      600.0);
+    declare_parameter("camera_cx",      320.0);
+    declare_parameter("camera_cy",      240.0);
+    declare_parameter("dist_coeffs",    std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
 
-    marker_size_   = get_parameter("marker_size").as_double();
-    camera_frame_  = get_parameter("camera_frame").as_string();
-    const int dict_id = get_parameter("dictionary_id").as_int();
+    marker_size_  = get_parameter("marker_size").as_double();
+    camera_frame_ = get_parameter("camera_frame").as_string();
+    const int dict_id      = get_parameter("dictionary_id").as_int();
+    const int camera_index = get_parameter("camera_index").as_int();
+    const double fps       = get_parameter("capture_fps").as_double();
+
+    // Build camera matrix from individual focal length / principal point parameters
+    const double fx = get_parameter("camera_fx").as_double();
+    const double fy = get_parameter("camera_fy").as_double();
+    const double cx = get_parameter("camera_cx").as_double();
+    const double cy = get_parameter("camera_cy").as_double();
+    camera_matrix_ = (cv::Mat_<double>(3, 3) <<
+      fx, 0,  cx,
+      0,  fy, cy,
+      0,  0,  1);
+
+    const auto dc = get_parameter("dist_coeffs").as_double_array();
+    dist_coeffs_ = cv::Mat(dc.size(), 1, CV_64F);
+    for (size_t i = 0; i < dc.size(); ++i) dist_coeffs_.at<double>(i) = dc[i];
 
     auto dict   = cv::aruco::getPredefinedDictionary(dict_id);
     auto params = cv::aruco::DetectorParameters();
     detector_   = std::make_unique<cv::aruco::ArucoDetector>(dict, params);
 
-    const auto image_topic = get_parameter("image_topic").as_string();
-    const auto info_topic  = get_parameter("camera_info_topic").as_string();
-
-    image_sub_ = create_subscription<sensor_msgs::msg::Image>(
-      image_topic, 10,
-      std::bind(&ArucoDistanceNode::imageCallback, this, std::placeholders::_1));
-
-    // Transient-local so we receive the latched camera info even if published before startup
-    camera_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
-      info_topic, rclcpp::QoS(1).transient_local(),
-      std::bind(&ArucoDistanceNode::cameraInfoCallback, this, std::placeholders::_1));
+    cap_.open(camera_index);
+    if (!cap_.isOpened()) {
+      RCLCPP_FATAL(get_logger(), "Cannot open camera index %d", camera_index);
+      throw std::runtime_error("Camera open failed");
+    }
 
     pose_pub_     = create_publisher<geometry_msgs::msg::PoseArray>("/aruco/poses", 10);
     ids_pub_      = create_publisher<std_msgs::msg::Int32MultiArray>("/aruco/ids", 10);
     distance_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>("/aruco/distances", 10);
     debug_pub_    = create_publisher<sensor_msgs::msg::Image>("/aruco/image_debug", 10);
-
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
+    const auto period = std::chrono::duration<double>(1.0 / fps);
+    timer_ = create_wall_timer(period, std::bind(&ArucoDistanceNode::timerCallback, this));
+
     RCLCPP_INFO(get_logger(),
-      "ArUco distance node started (dict=%d, marker_size=%.3f m)", dict_id, marker_size_);
+      "ArUco distance node started (camera=%d, dict=%d, marker_size=%.3f m, fps=%.1f)",
+      camera_index, dict_id, marker_size_, fps);
   }
+
+  ~ArucoDistanceNode() { cap_.release(); }
 
 private:
-  void cameraInfoCallback(const sensor_msgs::msg::CameraInfo::SharedPtr msg)
+  void timerCallback()
   {
-    if (!camera_matrix_.empty()) return;
-    camera_matrix_ = cv::Mat(3, 3, CV_64F, const_cast<double *>(msg->k.data())).clone();
-    dist_coeffs_   = cv::Mat(msg->d.size(), 1, CV_64F, const_cast<double *>(msg->d.data())).clone();
-    RCLCPP_INFO(get_logger(), "Camera intrinsics received.");
-  }
-
-  void imageCallback(const sensor_msgs::msg::Image::SharedPtr msg)
-  {
-    if (camera_matrix_.empty()) {
-      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000, "Waiting for camera_info...");
+    cv::Mat image;
+    if (!cap_.read(image) || image.empty()) {
+      RCLCPP_WARN(get_logger(), "Empty frame from camera, skipping.");
       return;
     }
-
-    cv::Mat image = cv_bridge::toCvCopy(msg, "bgr8")->image;
 
     std::vector<int> ids;
     std::vector<std::vector<cv::Point2f>> corners, rejected;
@@ -81,8 +91,6 @@ private:
     if (ids.empty()) return;
 
     const size_t N = ids.size();
-
-    // Marker 3-D corner points in marker-local frame (z=0 plane, origin at centre)
     const float half = static_cast<float>(marker_size_) / 2.f;
     const std::vector<cv::Point3f> obj_points = {
       {-half,  half, 0.f},
@@ -96,6 +104,8 @@ private:
       cv::solvePnP(obj_points, corners[i], camera_matrix_, dist_coeffs_, rvecs[i], tvecs[i]);
     }
 
+    const auto stamp = now();
+
     // ---- /aruco/ids ----
     std_msgs::msg::Int32MultiArray ids_msg;
     for (int id : ids) ids_msg.data.push_back(id);
@@ -103,7 +113,7 @@ private:
 
     // ---- /aruco/poses + /tf ----
     geometry_msgs::msg::PoseArray pose_array;
-    pose_array.header.stamp    = msg->header.stamp;
+    pose_array.header.stamp    = stamp;
     pose_array.header.frame_id = camera_frame_;
 
     for (size_t i = 0; i < N; ++i) {
@@ -122,7 +132,7 @@ private:
       pose_array.poses.push_back(pose);
 
       geometry_msgs::msg::TransformStamped tf;
-      tf.header.stamp    = msg->header.stamp;
+      tf.header.stamp    = stamp;
       tf.header.frame_id = camera_frame_;
       tf.child_frame_id  = "aruco_marker_" + std::to_string(ids[i]);
       tf.transform.translation.x = tvecs[i][0];
@@ -137,8 +147,7 @@ private:
     pose_pub_->publish(pose_array);
 
     // ---- /aruco/distances — N×N symmetric distance matrix ----
-    // Access: data[i*N + j] = distance in metres between marker i and j
-    // Row/column ordering matches the published /aruco/ids array
+    // data[i*N + j] = Euclidean 3-D distance in metres; row/col order matches /aruco/ids
     std_msgs::msg::Float64MultiArray dist_msg;
     dist_msg.layout.dim.resize(2);
     dist_msg.layout.dim[0].label  = "marker_i";
@@ -156,7 +165,7 @@ private:
         const double dz = tvecs[i][2] - tvecs[j][2];
         const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
         dist_msg.data[i * N + j] = dist;
-        dist_msg.data[j * N + i] = dist;  // symmetric
+        dist_msg.data[j * N + i] = dist;
       }
     }
     distance_pub_->publish(dist_msg);
@@ -174,7 +183,10 @@ private:
                   cv::Point(static_cast<int>(centre.x) + 5, static_cast<int>(centre.y) - 5),
                   cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 255), 1);
     }
-    debug_pub_->publish(*cv_bridge::CvImage(msg->header, "bgr8", image).toImageMsg());
+    std_msgs::msg::Header hdr;
+    hdr.stamp    = stamp;
+    hdr.frame_id = camera_frame_;
+    debug_pub_->publish(*cv_bridge::CvImage(hdr, "bgr8", image).toImageMsg());
   }
 
   // 3×3 rotation matrix -> quaternion [w, x, y, z]
@@ -191,13 +203,13 @@ private:
     return {w, x, y, z};
   }
 
+  cv::VideoCapture cap_;
   std::unique_ptr<cv::aruco::ArucoDetector> detector_;
   cv::Mat camera_matrix_, dist_coeffs_;
   double marker_size_;
   std::string camera_frame_;
 
-  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr pose_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr ids_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr distance_pub_;

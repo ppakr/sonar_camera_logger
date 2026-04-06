@@ -1,5 +1,6 @@
 #include <cmath>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include <rclcpp/rclcpp.hpp>
@@ -10,108 +11,189 @@
 #include <sensor_msgs/msg/image.hpp>
 #include <tf2_ros/transform_broadcaster.h>
 #include <cv_bridge/cv_bridge.hpp>
-#include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
 
 class ArucoDistanceNode : public rclcpp::Node
 {
 public:
   ArucoDistanceNode() : Node("aruco_distance_node")
   {
-    declare_parameter("camera_index",   0);
-    declare_parameter("capture_fps",    30.0);
-    declare_parameter("marker_size",    0.05);
-    declare_parameter("dictionary_id",  10);
-    declare_parameter("camera_frame",   "camera_optical_frame");
-    declare_parameter("camera_fx",      600.0);
-    declare_parameter("camera_fy",      600.0);
-    declare_parameter("camera_cx",      320.0);
-    declare_parameter("camera_cy",      240.0);
-    declare_parameter("dist_coeffs",    std::vector<double>{0.0, 0.0, 0.0, 0.0, 0.0});
+    declare_parameter("camera_index",         0);
+    declare_parameter("capture_fps",          30.0);
+    declare_parameter("marker_size",          0.05);
+    declare_parameter("camera_frame",         "camera_optical_frame");
+    declare_parameter("calibration_file",     "");
+    declare_parameter("detector_params_file", "");
 
-    marker_size_  = get_parameter("marker_size").as_double();
-    camera_frame_ = get_parameter("camera_frame").as_string();
-    const int dict_id      = get_parameter("dictionary_id").as_int();
-    const int camera_index = get_parameter("camera_index").as_int();
-    const double fps       = get_parameter("capture_fps").as_double();
+    const int    camera_index = get_parameter("camera_index").as_int();
+    const double fps          = get_parameter("capture_fps").as_double();
+    marker_size_              = get_parameter("marker_size").as_double();
+    camera_frame_             = get_parameter("camera_frame").as_string();
+    const auto   calib_file   = get_parameter("calibration_file").as_string();
+    const auto   params_file  = get_parameter("detector_params_file").as_string();
 
-    // Build camera matrix from individual focal length / principal point parameters
-    const double fx = get_parameter("camera_fx").as_double();
-    const double fy = get_parameter("camera_fy").as_double();
-    const double cx = get_parameter("camera_cx").as_double();
-    const double cy = get_parameter("camera_cy").as_double();
-    camera_matrix_ = (cv::Mat_<double>(3, 3) <<
-      fx, 0,  cx,
-      0,  fy, cy,
-      0,  0,  1);
+    // ── Camera intrinsics from YAML (same cv::FileStorage format as lab1) ─────
+    cv::FileStorage fs_calib(calib_file, cv::FileStorage::READ);
+    if (!fs_calib.isOpened()) {
+      RCLCPP_FATAL(get_logger(), "Cannot open calibration file: %s", calib_file.c_str());
+      throw std::runtime_error("Calibration file not found");
+    }
+    fs_calib["cameraMatrix"] >> camera_matrix_;
+    fs_calib["distCoeffs"]   >> dist_coeffs_;
+    fs_calib.release();
+    RCLCPP_INFO(get_logger(), "Calibration loaded from: %s", calib_file.c_str());
 
-    const auto dc = get_parameter("dist_coeffs").as_double_array();
-    dist_coeffs_ = cv::Mat(dc.size(), 1, CV_64F);
-    for (size_t i = 0; i < dc.size(); ++i) dist_coeffs_.at<double>(i) = dc[i];
+    // ── ArUco detector parameters from YAML (same format as lab1) ─────────────
+    cv::aruco::DetectorParameters detector_params;
+    cv::FileStorage fs_params(params_file, cv::FileStorage::READ);
+    if (fs_params.isOpened()) {
+      detector_params.readDetectorParameters(fs_params.root());
+      fs_params.release();
+      RCLCPP_INFO(get_logger(), "Detector params loaded from: %s", params_file.c_str());
+    } else {
+      RCLCPP_WARN(get_logger(), "Detector params file not found, using defaults: %s",
+                  params_file.c_str());
+    }
 
-    auto dict   = cv::aruco::getPredefinedDictionary(dict_id);
-    auto params = cv::aruco::DetectorParameters();
-    detector_   = std::make_unique<cv::aruco::ArucoDetector>(dict, params);
+    // ── DICT_4X4_50 fixed to match the printed markers (IDs 0–4) ──────────────
+    auto dict = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+    detector_ = std::make_unique<cv::aruco::ArucoDetector>(dict, detector_params);
 
+    // ── Open webcam ───────────────────────────────────────────────────────────
     cap_.open(camera_index);
     if (!cap_.isOpened()) {
       RCLCPP_FATAL(get_logger(), "Cannot open camera index %d", camera_index);
       throw std::runtime_error("Camera open failed");
     }
 
-    pose_pub_     = create_publisher<geometry_msgs::msg::PoseArray>("/aruco/poses", 10);
-    ids_pub_      = create_publisher<std_msgs::msg::Int32MultiArray>("/aruco/ids", 10);
-    distance_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>("/aruco/distances", 10);
-    debug_pub_    = create_publisher<sensor_msgs::msg::Image>("/aruco/image_debug", 10);
+    // ── ROS publishers ────────────────────────────────────────────────────────
+    pose_pub_       = create_publisher<geometry_msgs::msg::PoseArray>("/aruco/poses", 10);
+    ids_pub_        = create_publisher<std_msgs::msg::Int32MultiArray>("/aruco/ids", 10);
+    distance_pub_   = create_publisher<std_msgs::msg::Float64MultiArray>("/aruco/distances", 10);
+    debug_pub_      = create_publisher<sensor_msgs::msg::Image>("/aruco/image_debug", 10);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
+
+    cv::namedWindow("ArUco Distance Estimation", cv::WINDOW_AUTOSIZE);
 
     const auto period = std::chrono::duration<double>(1.0 / fps);
     timer_ = create_wall_timer(period, std::bind(&ArucoDistanceNode::timerCallback, this));
 
     RCLCPP_INFO(get_logger(),
-      "ArUco distance node started (camera=%d, dict=%d, marker_size=%.3f m, fps=%.1f)",
-      camera_index, dict_id, marker_size_, fps);
+      "ArUco distance node ready (camera=%d, DICT_4X4_50, marker_size=%.3f m)",
+      camera_index, marker_size_);
   }
 
-  ~ArucoDistanceNode() { cap_.release(); }
+  ~ArucoDistanceNode()
+  {
+    cap_.release();
+    cv::destroyAllWindows();
+  }
 
 private:
   void timerCallback()
   {
-    cv::Mat image;
-    if (!cap_.read(image) || image.empty()) {
-      RCLCPP_WARN(get_logger(), "Empty frame from camera, skipping.");
+    cv::Mat frame;
+    if (!cap_.read(frame) || frame.empty()) {
+      RCLCPP_WARN(get_logger(), "Empty frame, skipping.");
       return;
     }
 
+    // ── Detect markers ────────────────────────────────────────────────────────
     std::vector<int> ids;
     std::vector<std::vector<cv::Point2f>> corners, rejected;
-    detector_->detectMarkers(image, corners, ids, rejected);
+    detector_->detectMarkers(frame, corners, ids, rejected);
 
-    if (ids.empty()) return;
-
-    const size_t N = ids.size();
-    const float half = static_cast<float>(marker_size_) / 2.f;
-    const std::vector<cv::Point3f> obj_points = {
-      {-half,  half, 0.f},
-      { half,  half, 0.f},
-      { half, -half, 0.f},
-      {-half, -half, 0.f},
-    };
-
-    std::vector<cv::Vec3d> rvecs(N), tvecs(N);
-    for (size_t i = 0; i < N; ++i) {
-      cv::solvePnP(obj_points, corners[i], camera_matrix_, dist_coeffs_, rvecs[i], tvecs[i]);
+    if (ids.empty()) {
+      cv::imshow("ArUco Distance Estimation", frame);
+      cv::waitKey(1);
+      return;
     }
 
+    cv::aruco::drawDetectedMarkers(frame, corners, ids);
+
+    const size_t N    = ids.size();
+    const float  half = static_cast<float>(marker_size_) / 2.f;
+
+    // Marker object points in local frame — same layout as lab1
+    cv::Mat obj_pts(4, 1, CV_32FC3);
+    obj_pts.ptr<cv::Vec3f>(0)[0] = cv::Vec3f(-half,  half, 0.f);
+    obj_pts.ptr<cv::Vec3f>(0)[1] = cv::Vec3f( half,  half, 0.f);
+    obj_pts.ptr<cv::Vec3f>(0)[2] = cv::Vec3f( half, -half, 0.f);
+    obj_pts.ptr<cv::Vec3f>(0)[3] = cv::Vec3f(-half, -half, 0.f);
+
+    // ── Pose estimation for every detected marker ─────────────────────────────
+    std::vector<cv::Vec3d> rvecs(N), tvecs(N);
+    for (size_t i = 0; i < N; ++i) {
+      cv::solvePnP(obj_pts, corners[i], camera_matrix_, dist_coeffs_, rvecs[i], tvecs[i]);
+      cv::drawFrameAxes(frame, camera_matrix_, dist_coeffs_,
+                        rvecs[i], tvecs[i], half * 0.5f, 2);
+    }
+
+    // ── Project each marker centre to 2-D image space ─────────────────────────
+    cv::Mat centre_3d(1, 1, CV_32FC3);
+    centre_3d.ptr<cv::Vec3f>(0)[0] = cv::Vec3f(0.f, 0.f, 0.f);
+
+    std::vector<cv::Point2f> centres_2d(N);
+    for (size_t i = 0; i < N; ++i) {
+      std::vector<cv::Point2f> proj;
+      cv::projectPoints(centre_3d, rvecs[i], tvecs[i], camera_matrix_, dist_coeffs_, proj);
+      centres_2d[i] = proj[0];
+    }
+
+    // ── Draw all pairwise distances (lab1 style) ───────────────────────────────
+    int text_y = 30;
+    for (size_t i = 0; i < N; ++i) {
+      for (size_t j = i + 1; j < N; ++j) {
+        cv::Vec3d rel  = tvecs[i] - tvecs[j];
+        float     dist = static_cast<float>(cv::norm(rel));
+
+        // Green line between the two marker centres
+        cv::line(frame, centres_2d[i], centres_2d[j], cv::Scalar(0, 255, 0), 2);
+
+        // Distance label at midpoint of the line
+        cv::Point2f mid = (centres_2d[i] + centres_2d[j]) * 0.5f;
+        cv::putText(frame, cv::format("%.3f m", dist),
+                    cv::Point(static_cast<int>(mid.x) + 5, static_cast<int>(mid.y)),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 0), 2);
+
+        // Left-side summary block — same text layout as lab1
+        cv::putText(frame,
+                    "ID" + std::to_string(ids[i]) + " <-> ID" + std::to_string(ids[j]),
+                    cv::Point(10, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.7,
+                    cv::Scalar(0, 255, 0), 2);
+        text_y += 28;
+        cv::putText(frame, "  x: " + std::to_string(rel[0]),
+                    cv::Point(10, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv::Scalar(0, 255, 0), 2);
+        text_y += 25;
+        cv::putText(frame, "  y: " + std::to_string(rel[1]),
+                    cv::Point(10, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv::Scalar(0, 255, 0), 2);
+        text_y += 25;
+        cv::putText(frame, "  z: " + std::to_string(rel[2]),
+                    cv::Point(10, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv::Scalar(0, 255, 0), 2);
+        text_y += 25;
+        cv::putText(frame, "  dist: " + std::to_string(dist) + " m",
+                    cv::Point(10, text_y), cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv::Scalar(0, 255, 0), 2);
+        text_y += 35;
+      }
+    }
+
+    cv::imshow("ArUco Distance Estimation", frame);
+    cv::waitKey(1);
+
+    // ── Publish ROS topics ────────────────────────────────────────────────────
     const auto stamp = now();
 
-    // ---- /aruco/ids ----
     std_msgs::msg::Int32MultiArray ids_msg;
     for (int id : ids) ids_msg.data.push_back(id);
     ids_pub_->publish(ids_msg);
 
-    // ---- /aruco/poses + /tf ----
     geometry_msgs::msg::PoseArray pose_array;
     pose_array.header.stamp    = stamp;
     pose_array.header.frame_id = camera_frame_;
@@ -146,8 +228,7 @@ private:
     }
     pose_pub_->publish(pose_array);
 
-    // ---- /aruco/distances — N×N symmetric distance matrix ----
-    // data[i*N + j] = Euclidean 3-D distance in metres; row/col order matches /aruco/ids
+    // N×N symmetric distance matrix; data[i*N + j] = metres between marker i and j
     std_msgs::msg::Float64MultiArray dist_msg;
     dist_msg.layout.dim.resize(2);
     dist_msg.layout.dim[0].label  = "marker_i";
@@ -160,33 +241,17 @@ private:
 
     for (size_t i = 0; i < N; ++i) {
       for (size_t j = i + 1; j < N; ++j) {
-        const double dx = tvecs[i][0] - tvecs[j][0];
-        const double dy = tvecs[i][1] - tvecs[j][1];
-        const double dz = tvecs[i][2] - tvecs[j][2];
-        const double dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-        dist_msg.data[i * N + j] = dist;
-        dist_msg.data[j * N + i] = dist;
+        const double d = cv::norm(tvecs[i] - tvecs[j]);
+        dist_msg.data[i * N + j] = d;
+        dist_msg.data[j * N + i] = d;
       }
     }
     distance_pub_->publish(dist_msg);
 
-    // ---- /aruco/image_debug ----
-    cv::aruco::drawDetectedMarkers(image, corners, ids);
-    for (size_t i = 0; i < N; ++i) {
-      cv::drawFrameAxes(image, camera_matrix_, dist_coeffs_,
-                        rvecs[i], tvecs[i], half * 0.5f);
-      const cv::Point2f centre =
-        (corners[i][0] + corners[i][1] + corners[i][2] + corners[i][3]) * 0.25f;
-      const std::string label =
-        "id:" + std::to_string(ids[i]) + " z:" + cv::format("%.2f", tvecs[i][2]) + "m";
-      cv::putText(image, label,
-                  cv::Point(static_cast<int>(centre.x) + 5, static_cast<int>(centre.y) - 5),
-                  cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 255), 1);
-    }
     std_msgs::msg::Header hdr;
     hdr.stamp    = stamp;
     hdr.frame_id = camera_frame_;
-    debug_pub_->publish(*cv_bridge::CvImage(hdr, "bgr8", image).toImageMsg());
+    debug_pub_->publish(*cv_bridge::CvImage(hdr, "bgr8", frame).toImageMsg());
   }
 
   // 3×3 rotation matrix -> quaternion [w, x, y, z]

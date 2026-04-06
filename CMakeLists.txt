@@ -7,6 +7,7 @@ endif()
 
 # ── ROS 2 dependencies ────────────────────────────────────────────────────────
 find_package(ament_cmake REQUIRED)
+find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
@@ -98,6 +99,12 @@ install(TARGETS aruco_distance_node
 
 install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
+)
+
+# ── Python scripts ───────────────────────────────────────────────────────────
+install(PROGRAMS
+  scripts/sonar_driver.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 # ── tests ─────────────────────────────────────────────────────────────────────

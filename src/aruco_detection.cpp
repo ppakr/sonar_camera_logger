@@ -19,21 +19,22 @@
 class ArucoDistanceNode : public rclcpp::Node
 {
 public:
-  ArucoDistanceNode() : Node("aruco_distance_node")
+  ArucoDistanceNode()
+  : Node("aruco_distance_node")
   {
-    declare_parameter("camera_index",         0);
-    declare_parameter("capture_fps",          30.0);
-    declare_parameter("marker_size",          0.05);
-    declare_parameter("camera_frame",         "camera_optical_frame");
-    declare_parameter("calibration_file",     "");
+    declare_parameter("camera_index", 0);
+    declare_parameter("capture_fps", 30.0);
+    declare_parameter("marker_size", 0.05);
+    declare_parameter("camera_frame", "camera_optical_frame");
+    declare_parameter("calibration_file", "");
     declare_parameter("detector_params_file", "");
 
-    const int    camera_index = get_parameter("camera_index").as_int();
-    const double fps          = get_parameter("capture_fps").as_double();
-    marker_size_              = get_parameter("marker_size").as_double();
-    camera_frame_             = get_parameter("camera_frame").as_string();
-    const auto   calib_file   = get_parameter("calibration_file").as_string();
-    const auto   params_file  = get_parameter("detector_params_file").as_string();
+    const int camera_index = get_parameter("camera_index").as_int();
+    const double fps = get_parameter("capture_fps").as_double();
+    marker_size_ = get_parameter("marker_size").as_double();
+    camera_frame_ = get_parameter("camera_frame").as_string();
+    const auto calib_file = get_parameter("calibration_file").as_string();
+    const auto params_file = get_parameter("detector_params_file").as_string();
 
     // ── Camera intrinsics from YAML (same cv::FileStorage format as lab1) ─────
     cv::FileStorage fs_calib(calib_file, cv::FileStorage::READ);
@@ -42,7 +43,7 @@ public:
       throw std::runtime_error("Calibration file not found");
     }
     fs_calib["cameraMatrix"] >> camera_matrix_;
-    fs_calib["distCoeffs"]   >> dist_coeffs_;
+    fs_calib["distCoeffs"] >> dist_coeffs_;
     fs_calib.release();
     RCLCPP_INFO(get_logger(), "Calibration loaded from: %s", calib_file.c_str());
 
@@ -70,10 +71,11 @@ public:
     }
 
     // ── ROS publishers ────────────────────────────────────────────────────────
-    pose_pub_       = create_publisher<geometry_msgs::msg::PoseArray>("/aruco/poses", 10);
-    ids_pub_        = create_publisher<std_msgs::msg::Int32MultiArray>("/aruco/ids", 10);
-    distance_pub_   = create_publisher<std_msgs::msg::Float64MultiArray>("/aruco/distances", 10);
-    debug_pub_      = create_publisher<sensor_msgs::msg::Image>("/aruco/image_debug", 10);
+    pose_pub_ = create_publisher<geometry_msgs::msg::PoseArray>("/aruco/poses", 10);
+    ids_pub_ = create_publisher<std_msgs::msg::Int32MultiArray>("/aruco/ids", 10);
+    distance_pub_ =
+      create_publisher<std_msgs::msg::Float64MultiArray>("/aruco/distances", 10);
+    debug_pub_ = create_publisher<sensor_msgs::msg::Image>("/aruco/image_debug", 10);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
     cv::namedWindow("ArUco Distance Estimation", cv::WINDOW_AUTOSIZE);
@@ -114,7 +116,7 @@ private:
 
     cv::aruco::drawDetectedMarkers(frame, corners, ids);
 
-    const size_t N    = ids.size();
+    const size_t N = ids.size();
     const float  half = static_cast<float>(marker_size_) / 2.f;
 
     // Marker object points in local frame — same layout as lab1

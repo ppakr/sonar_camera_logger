@@ -101,6 +101,10 @@ install(DIRECTORY config/
   DESTINATION share/${PROJECT_NAME}/config
 )
 
+install(DIRECTORY launch/
+  DESTINATION share/${PROJECT_NAME}/launch
+)
+
 # ── Python scripts ───────────────────────────────────────────────────────────
 install(PROGRAMS
   scripts/sonar_driver.py
@@ -113,6 +117,19 @@ if(BUILD_TESTING)
   set(ament_cmake_copyright_FOUND TRUE)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
+
+  find_package(ament_cmake_pytest REQUIRED)
+
+  # Pure geometry unit tests — no ROS2 or hardware needed
+  ament_add_pytest_test(test_geometry test/test_geometry.py)
+
+  # Node unit tests — hardware mocked, ROS2 required
+  # ament_add_pytest_test(test_sonar_driver test/test_sonar_driver.py)
+
+  # Launch / integration tests — requires loopback alias for 192.168.1.96
+  # (auto-skipped when alias is absent, see test file for setup instructions)
+  # find_package(launch_testing_ament_cmake REQUIRED)
+  # add_launch_test(test/test_sonar_driver_launch.py)
 endif()
 
 ament_package()

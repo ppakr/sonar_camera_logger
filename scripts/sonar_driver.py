@@ -1,34 +1,38 @@
+"""ROS 2 Python driver for the WaterLinked 3D Sonar 3D-15."""
+import math
 import select as select_module
+from typing import List, Tuple
+
+import numpy as np
 import rclpy
 import rclpy.executors
-from rclpy.node import Node
-from sensor_msgs.msg import PointCloud2, Image
-from builtin_interfaces.msg import Time
-from std_msgs.msg import Header
-from sensor_msgs_py import point_cloud2
-from sensor_msgs.msg import PointField
-import numpy as np
 import wlsonar
 import wlsonar.range_image_protocol as rip
-from typing import List, Tuple
-import math
+from builtin_interfaces.msg import Time
+from rclpy.node import Node
+from sensor_msgs.msg import Image, PointCloud2, PointField
+from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Header
 
 
 class SonarDriver(Node):
-    def __init__(self):
-        super().__init__("WaterLinked_3D_Sonar_Driver")
+    """ROS 2 node that receives WaterLinked sonar data and publishes ROS messages."""
 
-        self.sonar_ip = "192.168.1.96"
-        self.frame_id = "sonar_link"
+    def __init__(self):
+        """Initialize the sonar driver node."""
+        super().__init__('WaterLinked_3D_Sonar_Driver')
+
+        self.sonar_ip = '192.168.1.96'
+        self.frame_id = 'sonar_link'
 
         self.publisher_pointcloud = self.create_publisher(
-            PointCloud2, "/blueye/sonar_3d/pointcloud", 10
+            PointCloud2, '/blueye/sonar_3d/pointcloud', 10
         )
         self.publisher_intensity_img = self.create_publisher(
-            Image, "/blueye/sonar_3d/strength_image", 10
+            Image, '/blueye/sonar_3d/strength_image', 10
         )
         self.publisher_pointcloud_intensity = self.create_publisher(
-            PointCloud2, "/blueye/sonar_3d/pointcloud_intensity", 10
+            PointCloud2, '/blueye/sonar_3d/pointcloud_intensity', 10
         )
 
         # Connect to sonar over HTTP, enable acoustics, configure UDP multicast
@@ -38,21 +42,23 @@ class SonarDriver(Node):
 
         self.sock = wlsonar.open_sonar_udp_multicast_socket()
 
-        self.get_logger().info("Sonar driver initialized and running.")
+        self.get_logger().info('Sonar driver initialized and running.')
 
         self.fields = [
-            PointField(name="x", offset=0, datatype=PointField.FLOAT32, count=1),
-            PointField(name="y", offset=4, datatype=PointField.FLOAT32, count=1),
-            PointField(name="z", offset=8, datatype=PointField.FLOAT32, count=1),
-            PointField(name="intensity", offset=12, datatype=PointField.UINT8, count=1),
+            PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+            PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+            PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+            PointField(
+                name='intensity', offset=12, datatype=PointField.UINT8, count=1
+            ),
         ]
 
         self.dtype = np.dtype(
             [
-                ("x", np.float32),
-                ("y", np.float32),
-                ("z", np.float32),
-                ("intensity", np.uint8),
+                ('x', np.float32),
+                ('y', np.float32),
+                ('z', np.float32),
+                ('intensity', np.uint8),
             ]
         )
 
@@ -60,13 +66,19 @@ class SonarDriver(Node):
         self.strength_buffer = {}
         self.max_buffer_size = 50
 
-        self.get_logger().info("Sonar driver setup complete, waiting for data...")
+        self.get_logger().info('Sonar driver setup complete, waiting for data...')
 
     def handle_packet(self, packet: bytes) -> None:
         """Parse one UDP packet and publish whatever it contains."""
         try:
             msg = rip.unpackb(packet)
-        except rip.UnknownProtobufTypeError:
+        except (
+            rip.UnknownProtobufTypeError,
+            rip.BadIDError,
+            rip.CRCMismatchError,
+            rip.ExtraDataError,
+            ValueError,
+        ):
             return
 
         if isinstance(msg, rip.RangeImage):
@@ -74,7 +86,7 @@ class SonarDriver(Node):
         elif isinstance(msg, rip.BitmapImageGreyscale8):
             self._handle_strength_image(msg)
         else:
-            raise RuntimeError(f"Unhandled message type: {type(msg)}")
+            raise RuntimeError(f'Unhandled message type: {type(msg)}')
 
         self._buffer_handler()
 
@@ -84,7 +96,8 @@ class SonarDriver(Node):
         xyz_points = wlsonar.range_image_to_xyz(msg)
         header = Header()
         header.stamp = Time(
-            sec=msg.header.timestamp.seconds, nanosec=msg.header.timestamp.nanos
+            sec=msg.header.timestamp.seconds,
+            nanosec=msg.header.timestamp.nanos,
         )
         header.frame_id = self.frame_id
         self.publisher_pointcloud.publish(
@@ -94,7 +107,8 @@ class SonarDriver(Node):
     def _handle_strength_image(self, msg: rip.BitmapImageGreyscale8) -> None:
         if msg.type != rip.BitmapImageType.SIGNAL_STRENGTH_IMAGE:
             self.get_logger().warn(
-                "Skipping BitmapImageGreyscale8 of type other than SIGNAL_STRENGTH_IMAGE"
+                'Skipping BitmapImageGreyscale8 of type other than'
+                ' SIGNAL_STRENGTH_IMAGE'
             )
             return
 
@@ -102,12 +116,13 @@ class SonarDriver(Node):
 
         ros_image = Image()
         ros_image.header.stamp = Time(
-            sec=msg.header.timestamp.seconds, nanosec=msg.header.timestamp.nanos
+            sec=msg.header.timestamp.seconds,
+            nanosec=msg.header.timestamp.nanos,
         )
         ros_image.header.frame_id = self.frame_id
         ros_image.width = msg.width
         ros_image.height = msg.height
-        ros_image.encoding = "mono8"
+        ros_image.encoding = 'mono8'
         ros_image.step = msg.width
 
         img_array = np.frombuffer(msg.image_pixel_data, dtype=np.uint8).reshape(
@@ -122,6 +137,7 @@ class SonarDriver(Node):
         range_image: rip.RangeImage,
         strength_image: rip.BitmapImageGreyscale8,
     ) -> List[Tuple[float, float, float, float]]:
+        """Convert a RangeImage + strength image pair to a list of (x,y,z,i) tuples."""
         voxels = []
         max_pixel_x = range_image.width - 1
         max_pixel_y = range_image.height - 1
@@ -156,14 +172,15 @@ class SonarDriver(Node):
             self._create_intensity_pointcloud(r_msg, s_msg)
 
         for buf, name in [
-            (self.range_buffer, "Range"),
-            (self.strength_buffer, "Strength"),
+            (self.range_buffer, 'Range'),
+            (self.strength_buffer, 'Strength'),
         ]:
             while len(buf) > self.max_buffer_size:
                 oldest = min(buf)
                 buf.pop(oldest)
                 self.get_logger().warn(
-                    f"Buffer overflow: dropped orphaned {name} message (ID={oldest})"
+                    f'Buffer overflow: dropped orphaned {name}'
+                    f' message (ID={oldest})'
                 )
 
     def _create_intensity_pointcloud(
@@ -186,11 +203,13 @@ class SonarDriver(Node):
         )
 
     def cleanup(self) -> None:
+        """Disable acoustics and close the UDP socket."""
         self.sonar.set_acoustics_enabled(False)
         self.sock.close()
 
 
 def main(args=None):
+    """Run the sonar driver node using a select()-based event loop."""
     rclpy.init(args=args)
     node = SonarDriver()
     executor = rclpy.executors.SingleThreadedExecutor()
@@ -223,5 +242,5 @@ def main(args=None):
             rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -26,5 +26,15 @@ def generate_launch_description():
                 parameters=[params_file],
                 output="screen",
             ),
+            Node(
+                package="sonar_camera_logger",
+                executable="sonar_camera_fusion.py",
+                name="sonar_camera_fusion",
+                output="screen",
+                parameters=[
+                    {"slop": 0.1},       # max time difference (s) to still pair messages
+                    {"queue_size": 10},  # per-topic buffer depth
+                ],
+            ),
         ]
     )

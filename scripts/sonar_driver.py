@@ -65,7 +65,30 @@ class SonarDriver(Node):
         self.strength_buffer = {}
         self.max_buffer_size = 50
 
+        # One-time offset to align the sonar hardware clock to the ROS wall clock.
+        # Computed from the first packet received; applied to every timestamp thereafter.
+        self._clock_offset_ns: int = 0
+        self._offset_initialized: bool = False
+
         self.get_logger().info("Sonar driver setup complete, waiting for data...")
+
+    def _adjusted_stamp(self, hw_sec: int, hw_ns: int) -> Time:
+        """Return a ROS Time aligned to the ROS wall clock.
+
+        On the first call, compute the offset between the sonar hardware clock
+        and the ROS wall clock and store it.  Every subsequent call applies the
+        same offset so that relative timing between sonar frames is preserved.
+        """
+        if not self._offset_initialized:
+            hw_ns_total = hw_sec * 10**9 + hw_ns
+            ros_ns_total = self.get_clock().now().nanoseconds
+            self._clock_offset_ns = ros_ns_total - hw_ns_total
+            self._offset_initialized = True
+            self.get_logger().info(
+                f"Sonar clock offset calibrated: {self._clock_offset_ns / 1e9:.3f} s"
+            )
+        corrected_ns = hw_sec * 10**9 + hw_ns + self._clock_offset_ns
+        return Time(sec=int(corrected_ns // 10**9), nanosec=int(corrected_ns % 10**9))
 
     def handle_packet(self, packet: bytes) -> None:
         """Parse one UDP packet and publish whatever it contains."""
@@ -94,9 +117,9 @@ class SonarDriver(Node):
 
         xyz_points = wlsonar.range_image_to_xyz(msg)
         header = Header()
-        header.stamp = Time(
-            sec=msg.header.timestamp.seconds,
-            nanosec=msg.header.timestamp.nanos,
+        header.stamp = self._adjusted_stamp(
+            msg.header.timestamp.seconds,
+            msg.header.timestamp.nanos,
         )
         header.frame_id = self.frame_id
         self.publisher_pointcloud.publish(
@@ -114,9 +137,9 @@ class SonarDriver(Node):
         self.strength_buffer[msg.header.sequence_id] = msg
 
         ros_image = Image()
-        ros_image.header.stamp = Time(
-            sec=msg.header.timestamp.seconds,
-            nanosec=msg.header.timestamp.nanos,
+        ros_image.header.stamp = self._adjusted_stamp(
+            msg.header.timestamp.seconds,
+            msg.header.timestamp.nanos,
         )
         ros_image.header.frame_id = self.frame_id
         ros_image.width = msg.width
@@ -189,9 +212,9 @@ class SonarDriver(Node):
     ) -> None:
         points_xyzi = self._range_image_to_xyzi(range_img, strength_img)
         header = Header()
-        header.stamp = Time(
-            sec=range_img.header.timestamp.seconds,
-            nanosec=range_img.header.timestamp.nanos,
+        header.stamp = self._adjusted_stamp(
+            range_img.header.timestamp.seconds,
+            range_img.header.timestamp.nanos,
         )
         header.frame_id = self.frame_id
         points_np = np.array(points_xyzi, dtype=self.dtype)

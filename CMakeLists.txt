@@ -108,6 +108,7 @@ install(DIRECTORY launch/
 # ── Python scripts ───────────────────────────────────────────────────────────
 install(PROGRAMS
   scripts/sonar_driver.py
+  scripts/sonar_camera_fusion.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """ROS 2 Python driver for the WaterLinked 3D Sonar 3D-15."""
 
 import math

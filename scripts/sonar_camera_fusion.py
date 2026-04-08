@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Fuse sonar point-cloud and camera ArUco data using approximate time sync.
 
 Subscribes to:

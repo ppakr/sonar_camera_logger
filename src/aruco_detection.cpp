@@ -132,6 +132,31 @@ private:
       cv::solvePnP(obj_pts, corners[i], camera_matrix_, dist_coeffs_, rvecs[i], tvecs[i]);
       cv::drawFrameAxes(frame, camera_matrix_, dist_coeffs_,
                         rvecs[i], tvecs[i], half * 0.5f, 2);
+
+      // 6-DOF overlay near each marker: position (m) + orientation (deg, ZYX)
+      cv::Mat R;
+      cv::Rodrigues(rvecs[i], R);
+      const auto rpy = rotMatToRPY(R);  // [roll, pitch, yaw] in degrees
+
+      // Project the marker centre so the text follows the marker in image space
+      std::vector<cv::Point2f> ctr_proj;
+      cv::Mat ctr_3d(1, 1, CV_32FC3);
+      ctr_3d.ptr<cv::Vec3f>(0)[0] = cv::Vec3f(0.f, 0.f, 0.f);
+      cv::projectPoints(ctr_3d, rvecs[i], tvecs[i], camera_matrix_, dist_coeffs_, ctr_proj);
+      const int tx = static_cast<int>(ctr_proj[0].x) + 10;
+      int       ty = static_cast<int>(ctr_proj[0].y) + 15;
+      const cv::Scalar col(255, 200, 0);
+      const double fs = 0.45;
+      cv::putText(frame, "ID " + std::to_string(ids[i]),
+                  cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, fs + 0.05, col, 2);
+      ty += 18;
+      cv::putText(frame, cv::format("x:%.3f y:%.3f z:%.3f m",
+                  tvecs[i][0], tvecs[i][1], tvecs[i][2]),
+                  cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, fs, col, 1);
+      ty += 18;
+      cv::putText(frame, cv::format("R:%.1f P:%.1f Y:%.1f deg",
+                  rpy[0], rpy[1], rpy[2]),
+                  cv::Point(tx, ty), cv::FONT_HERSHEY_SIMPLEX, fs, col, 1);
     }
 
     // ── Project each marker centre to 2-D image space ─────────────────────────
@@ -254,6 +279,23 @@ private:
     hdr.stamp    = stamp;
     hdr.frame_id = camera_frame_;
     debug_pub_->publish(*cv_bridge::CvImage(hdr, "bgr8", frame).toImageMsg());
+  }
+
+  // 3×3 rotation matrix -> [roll, pitch, yaw] in degrees (ZYX / extrinsic XYZ convention)
+  static std::array<double, 3> rotMatToRPY(const cv::Mat & R)
+  {
+    const double pitch = std::asin(-R.at<double>(2, 0));
+    double roll, yaw;
+    if (std::abs(std::cos(pitch)) > 1e-6) {
+      roll = std::atan2(R.at<double>(2, 1), R.at<double>(2, 2));
+      yaw  = std::atan2(R.at<double>(1, 0), R.at<double>(0, 0));
+    } else {
+      // Gimbal lock
+      roll = std::atan2(-R.at<double>(1, 2), R.at<double>(1, 1));
+      yaw  = 0.0;
+    }
+    constexpr double rad2deg = 180.0 / M_PI;
+    return {roll * rad2deg, pitch * rad2deg, yaw * rad2deg};
   }
 
   // 3×3 rotation matrix -> quaternion [w, x, y, z]

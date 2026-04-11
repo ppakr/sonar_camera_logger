@@ -1,0 +1,23 @@
+camera_calibration_node:
+  ros__parameters:
+
+    # ── Camera ────────────────────────────────────────────────────────────────
+    camera_index: 1          # /dev/video<N> — must match aruco_distance_node
+
+    # ── ArUco dictionary (must match the calibration board you printed) ───────
+    dictionary: DICT_4X4_50
+
+    # ── Detector parameters (same file used by aruco_distance_node) ───────────
+    detector_params_file: /home/aki/auv_ws/src/sonar_camera_logger/config/aruco_detector_parameters.yaml
+
+    # ── GridBoard geometry — adjust to your printed board ─────────────────────
+    rows: 5                  # number of marker rows on the board
+    cols: 7                  # number of marker columns on the board
+    marker_length: 0.052      # side length of one marker in metres
+    marker_separation: 0.014  # gap between adjacent markers in metres
+
+    # ── Calibration settings ──────────────────────────────────────────────────
+    min_frames: 20           # minimum good captures before calibration runs
+
+    # ── Output — overwrites the file used by aruco_distance_node ─────────────
+    calibration_output_file: /home/aki/auv_ws/src/sonar_camera_logger/config/calibration_parameters.yaml

@@ -24,7 +24,7 @@ class SonarDriver(Node):
         """Initialize the sonar driver node."""
         super().__init__("WaterLinked_3D_Sonar_Driver")
 
-        self.sonar_ip = "192.168.1.96"
+        self.sonar_ip = "192.168.194.96"
         self.frame_id = "sonar_link"
 
         self.publisher_pointcloud = self.create_publisher(
@@ -37,12 +37,16 @@ class SonarDriver(Node):
             PointCloud2, "/sonar_3d/pointcloud_intensity", 10
         )
 
-        # Connect to sonar over HTTP, enable acoustics, configure UDP multicast
-        self.sonar = wlsonar.Sonar3D(self.sonar_ip)
-        self.sonar.set_acoustics_enabled(True)
-        self.sonar.set_udp_multicast()
+        # These are set to None until _try_connect() succeeds.
+        self.sonar = None
+        self.sock = None
 
-        self.sock = wlsonar.open_sonar_udp_multicast_socket()
+        # Try to connect immediately. If the sonar is not reachable, a retry
+        # timer will keep trying every 5 seconds until it succeeds.
+        self._connect_timer = None
+        self._try_connect()
+        if self.sonar is None:
+            self._connect_timer = self.create_timer(5.0, self._try_connect)
 
         self.get_logger().info("Sonar driver initialized and running.")
 
@@ -72,6 +76,31 @@ class SonarDriver(Node):
         self._offset_initialized: bool = False
 
         self.get_logger().info("Sonar driver setup complete, waiting for data...")
+
+    def _try_connect(self) -> None:
+        """Attempt to connect to the sonar over HTTP and open the UDP socket.
+
+        Called once at startup and then every 5 seconds by a timer until the
+        sonar is reachable. On success the timer is cancelled and the driver
+        starts receiving data normally.
+        """
+        try:
+            self.sonar = wlsonar.Sonar3D(self.sonar_ip)
+            self.sonar.set_acoustics_enabled(True)
+            self.sonar.set_udp_multicast()
+            self.sock = wlsonar.open_sonar_udp_multicast_socket(iface_ip="192.168.194.90")
+            self.get_logger().info(f"Connected to sonar at {self.sonar_ip}.")
+            # Stop retrying now that we are connected.
+            if self._connect_timer is not None:
+                self._connect_timer.cancel()
+                self._connect_timer = None
+        except Exception as e:
+            self.sonar = None
+            self.sock = None
+            self.get_logger().warn(
+                f"Could not connect to sonar at {self.sonar_ip}: {e}. "
+                "Retrying in 5 s..."
+            )
 
     def _adjusted_stamp(self, hw_sec: int, hw_ns: int) -> Time:
         """Return a ROS Time aligned to the ROS wall clock.
@@ -227,8 +256,13 @@ class SonarDriver(Node):
 
     def cleanup(self) -> None:
         """Disable acoustics and close the UDP socket."""
-        self.sonar.set_acoustics_enabled(False)
-        self.sock.close()
+        if self.sonar is not None:
+            try:
+                self.sonar.set_acoustics_enabled(False)
+            except Exception:
+                pass
+        if self.sock is not None:
+            self.sock.close()
 
 
 def main(args=None):
@@ -240,6 +274,12 @@ def main(args=None):
 
     try:
         while rclpy.ok():
+            # If the sonar socket is not yet open (still waiting for connection),
+            # just service ROS2 callbacks so the retry timer keeps firing.
+            if node.sock is None:
+                executor.spin_once(timeout_sec=0.01)
+                continue
+
             # Block up to 10ms waiting for a UDP packet OR a ROS2 event.
             # select() asks the OS to watch sock for incoming data. When a
             # packet arrives the OS wakes us immediately; if nothing arrives

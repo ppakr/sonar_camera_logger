@@ -2,12 +2,12 @@ aruco_distance_node:
   ros__parameters:
 
     # ── Camera capture ────────────────────────────────────────────────────────
-    camera_index: 0        # /dev/video<N> index; change if using an external webcam
+    camera_index: 1        # /dev/video<N> index; change if using an external webcam
     capture_fps: 30.0      # frames per second to grab from the webcam
 
     # ── ArUco detector ────────────────────────────────────────────────────────
     # Dictionary is fixed to DICT_4X4_50 in code (matches printed markers IDs 0–4)
-    marker_size: 0.075      # physical side length of printed marker in metres
+    marker_size: 0.15      # physical side length of printed marker in metres
     camera_frame: camera_optical_frame
 
     # ── Calibration files (OpenCV FileStorage YAML format, same as lab1) ──────

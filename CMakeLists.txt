@@ -14,7 +14,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(cv_bridge REQUIRED)
-find_package(OpenCV REQUIRED COMPONENTS core imgproc objdetect)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc objdetect calib3d)
 
 # ── Third-party dependencies ──────────────────────────────────────────────────
 find_package(Protobuf REQUIRED)
@@ -94,6 +94,18 @@ ament_target_dependencies(aruco_distance_node
 target_link_libraries(aruco_distance_node ${OpenCV_LIBS})
 
 install(TARGETS aruco_distance_node
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+# ── camera_calibration_node ───────────────────────────────────────────────────
+add_executable(camera_calibration_node src/camera_calibration.cpp)
+target_include_directories(camera_calibration_node PRIVATE ${OpenCV_INCLUDE_DIRS})
+ament_target_dependencies(camera_calibration_node
+  rclcpp
+)
+target_link_libraries(camera_calibration_node ${OpenCV_LIBS})
+
+install(TARGETS camera_calibration_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Apply static geometric corrections to ArUco tag poses and compute corrected
-sonar-to-object distances.
+Apply static geometric corrections to ArUco tag poses and write corrected
+MCAP bags that include all original topics plus two new topics.
 
 Background
 ----------
@@ -21,8 +21,15 @@ where
     R_tag_cam      = rotation matrix from rvec via Rodrigues (tag→camera)
     offset_in_tag_frame = fixed ENU offset from tag to component
 
-The sonar-object distance is then computed as the Euclidean distance between
-the two corrected positions in the camera frame (distance is frame-invariant).
+Output bags contain:
+  - All topics from the input corrected bag (passed through verbatim)
+  - /aruco/corrected_poses  (geometry_msgs/msg/PoseArray)
+        Poses in camera frame after applying tag→component offsets.
+        Ordered [sonar_head, object_center] for detected markers only;
+        same ordering as /aruco/ids but only for the two assigned IDs.
+  - /aruco/sonar_object_distance  (std_msgs/msg/Float64)
+        Euclidean sonar-to-object distance in metres.
+        -1.0 when either marker is not detected in that frame.
 
 Default marker assignments (from detection frequency in the Apr-9 dataset):
     ID 0 → floating object  (most frequently detected)
@@ -46,6 +53,13 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+# ── New topics written into every output bag ──────────────────────────────────
+
+ARUCO_IMAGE_TOPIC = "/aruco/image_debug"
+CORRECTED_POSES_TOPIC = "/aruco/corrected_poses"
+SONAR_OBJECT_DISTANCE_TOPIC = "/aruco/sonar_object_distance"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -75,24 +89,27 @@ def corrected_position(tvec: np.ndarray, rvec: np.ndarray, offset: np.ndarray) -
     return tvec + R @ offset
 
 
-# ── CSV fields ────────────────────────────────────────────────────────────────
+def rvec_to_quaternion(rvec: np.ndarray):
+    """Rodrigues vector → quaternion (w, x, y, z).
 
-CSV_FIELDS = [
-    "timestamp_ns",
-    "timestamp_sec",
-    # raw tag positions in camera frame
-    "sonar_tag_tx", "sonar_tag_ty", "sonar_tag_tz",
-    "object_tag_tx", "object_tag_ty", "object_tag_tz",
-    # corrected component positions in camera frame
-    "sonar_tx", "sonar_ty", "sonar_tz",
-    "object_tx", "object_ty", "object_tz",
-    # distances
-    "sonar_object_distance_m",     # between corrected positions (primary result)
-    "tag_tag_distance_m",          # raw tag-to-tag distance (for comparison)
-    # detection flags
-    "sonar_tag_detected",
-    "object_tag_detected",
-]
+    Mirrors the rotMatToQuat() in aruco_detection.cpp for consistency.
+    """
+    R, _ = cv2.Rodrigues(rvec)
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    w = np.sqrt(max(0.0, 1.0 + trace)) / 2.0
+    x = np.sqrt(max(0.0, 1.0 + R[0, 0] - R[1, 1] - R[2, 2])) / 2.0
+    y = np.sqrt(max(0.0, 1.0 - R[0, 0] + R[1, 1] - R[2, 2])) / 2.0
+    z = np.sqrt(max(0.0, 1.0 - R[0, 0] - R[1, 1] + R[2, 2])) / 2.0
+    x = float(np.copysign(x, R[2, 1] - R[1, 2]))
+    y = float(np.copysign(y, R[0, 2] - R[2, 0]))
+    z = float(np.copysign(z, R[1, 0] - R[0, 1]))
+    return float(w), x, y, z
+
+
+def image_msg_to_cv2(msg):
+    arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    channels = len(msg.data) // (msg.height * msg.width)
+    return arr.reshape(msg.height, msg.width, channels)
 
 
 # ── Per-bag processing ────────────────────────────────────────────────────────
@@ -107,104 +124,159 @@ def process_bag(
     object_marker_id: int,
     sonar_offset: np.ndarray,
     object_offset: np.ndarray,
-    output_csv: str,
+    output_bag_dir: str,
+    camera_frame: str,
 ):
-    """Reprocess one bag and write corrected poses + distances to CSV.
+    """Reprocess one bag: pass through all topics and append corrected pose topics.
 
-    Returns (total_frames, frames_with_both_tags).
+    Returns (total_aruco_frames, frames_with_both_tags).
     """
     import rosbag2_py
-    from rclpy.serialization import deserialize_message
+    from rclpy.serialization import deserialize_message, serialize_message
     from sensor_msgs.msg import Image
+    from geometry_msgs.msg import Pose, PoseArray
+    from std_msgs.msg import Float64
 
-    # solvePnP object points — same corner layout as aruco_detection.cpp
     half = marker_size / 2.0
     obj_pts = np.array(
         [[-half, half, 0.0], [half, half, 0.0], [half, -half, 0.0], [-half, -half, 0.0]],
         dtype=np.float32,
     ).reshape(4, 1, 3)
 
+    # ── Reader ────────────────────────────────────────────────────────────────
     reader = rosbag2_py.SequentialReader()
     reader.open(
         rosbag2_py.StorageOptions(uri=bag_path, storage_id="mcap"),
         rosbag2_py.ConverterOptions("cdr", "cdr"),
     )
-    reader.set_filter(rosbag2_py.StorageFilter(topics=["/aruco/image_debug"]))
+    # Discover all topics present in the input bag
+    input_topic_meta = reader.get_all_topics_and_types()
+
+    # ── Writer ────────────────────────────────────────────────────────────────
+    # rosbag2_py creates the bag directory itself — do NOT mkdir beforehand.
+    writer = rosbag2_py.SequentialWriter()
+    writer.open(
+        rosbag2_py.StorageOptions(uri=output_bag_dir, storage_id="mcap"),
+        rosbag2_py.ConverterOptions("cdr", "cdr"),
+    )
+
+    # Register all input topics
+    for idx, tm in enumerate(input_topic_meta):
+        writer.create_topic(
+            rosbag2_py.TopicMetadata(
+                id=idx,
+                name=tm.name,
+                type=tm.type,
+                serialization_format="cdr",
+            )
+        )
+
+    # Register new corrected topics
+    base_id = len(input_topic_meta)
+    writer.create_topic(
+        rosbag2_py.TopicMetadata(
+            id=base_id,
+            name=CORRECTED_POSES_TOPIC,
+            type="geometry_msgs/msg/PoseArray",
+            serialization_format="cdr",
+        )
+    )
+    writer.create_topic(
+        rosbag2_py.TopicMetadata(
+            id=base_id + 1,
+            name=SONAR_OBJECT_DISTANCE_TOPIC,
+            type="std_msgs/msg/Float64",
+            serialization_format="cdr",
+        )
+    )
 
     total_frames = 0
     both_detected = 0
 
-    with open(output_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS)
-        writer.writeheader()
+    while reader.has_next():
+        topic, data, t_ns = reader.read_next()
 
-        while reader.has_next():
-            topic, data, t_ns = reader.read_next()
-            msg = deserialize_message(data, Image)
-            arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
-            channels = len(msg.data) // (msg.height * msg.width)
-            frame = arr.reshape(msg.height, msg.width, channels)
-            total_frames += 1
-            t_sec = t_ns * 1e-9
+        # Always pass through the original message unchanged
+        writer.write(topic, data, t_ns)
 
-            corners, ids, _ = detector.detectMarkers(frame)
+        # Only process ArUco image frames for correction
+        if topic != ARUCO_IMAGE_TOPIC:
+            continue
 
-            # Build a {marker_id: (tvec, rvec)} lookup for this frame
-            poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
-            if ids is not None and len(ids) > 0:
-                for i, mid in enumerate(ids.flatten().tolist()):
-                    ok, rvec, tvec = cv2.solvePnP(
-                        obj_pts, corners[i], camera_matrix, dist_coeffs,
-                        flags=cv2.SOLVEPNP_IPPE_SQUARE,
-                    )
-                    if ok:
-                        poses[int(mid)] = (tvec.flatten(), rvec.flatten())
+        total_frames += 1
+        msg = deserialize_message(data, Image)
+        frame = image_msg_to_cv2(msg)
 
-            has_sonar  = sonar_marker_id  in poses
-            has_object = object_marker_id in poses
+        sec = int(t_ns // 1_000_000_000)
+        nanosec = int(t_ns % 1_000_000_000)
 
-            row: dict = {
-                "timestamp_ns":  t_ns,
-                "timestamp_sec": f"{t_sec:.9f}",
-                "sonar_tag_detected":  int(has_sonar),
-                "object_tag_detected": int(has_object),
-            }
+        corners, ids, _ = detector.detectMarkers(frame)
 
-            # Fill sonar fields
-            if has_sonar:
-                t_s, r_s = poses[sonar_marker_id]
-                p_s = corrected_position(t_s, r_s, sonar_offset)
-                row.update({
-                    "sonar_tag_tx": f"{t_s[0]:.6f}",
-                    "sonar_tag_ty": f"{t_s[1]:.6f}",
-                    "sonar_tag_tz": f"{t_s[2]:.6f}",
-                    "sonar_tx": f"{p_s[0]:.6f}",
-                    "sonar_ty": f"{p_s[1]:.6f}",
-                    "sonar_tz": f"{p_s[2]:.6f}",
-                })
+        # Build {marker_id: (tvec, rvec)} for this frame
+        poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        if ids is not None and len(ids) > 0:
+            for i, mid in enumerate(ids.flatten().tolist()):
+                ok, rvec, tvec = cv2.solvePnP(
+                    obj_pts, corners[i], camera_matrix, dist_coeffs,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE,
+                )
+                if ok:
+                    poses[int(mid)] = (tvec.flatten(), rvec.flatten())
 
-            # Fill object fields
-            if has_object:
-                t_o, r_o = poses[object_marker_id]
-                p_o = corrected_position(t_o, r_o, object_offset)
-                row.update({
-                    "object_tag_tx": f"{t_o[0]:.6f}",
-                    "object_tag_ty": f"{t_o[1]:.6f}",
-                    "object_tag_tz": f"{t_o[2]:.6f}",
-                    "object_tx": f"{p_o[0]:.6f}",
-                    "object_ty": f"{p_o[1]:.6f}",
-                    "object_tz": f"{p_o[2]:.6f}",
-                })
+        has_sonar  = sonar_marker_id  in poses
+        has_object = object_marker_id in poses
 
-            # Compute distances only when both are visible
-            if has_sonar and has_object:
-                both_detected += 1
-                t_s, _ = poses[sonar_marker_id]
-                t_o, _ = poses[object_marker_id]
-                row["tag_tag_distance_m"] = f"{np.linalg.norm(t_s - t_o):.6f}"
-                row["sonar_object_distance_m"] = f"{np.linalg.norm(p_s - p_o):.6f}"
+        # ── /aruco/corrected_poses ────────────────────────────────────────────
+        # One Pose per detected assigned marker: [sonar_head, object_center]
+        # Position = corrected component location in camera frame.
+        # Orientation = tag orientation (same as /aruco/poses for that marker).
+        corrected_pose_msg = PoseArray()
+        corrected_pose_msg.header.stamp.sec     = sec
+        corrected_pose_msg.header.stamp.nanosec = nanosec
+        corrected_pose_msg.header.frame_id      = camera_frame
 
-            writer.writerow(row)
+        for marker_id, offset in [
+            (sonar_marker_id,  sonar_offset),
+            (object_marker_id, object_offset),
+        ]:
+            if marker_id not in poses:
+                continue
+            tvec, rvec = poses[marker_id]
+            p = corrected_position(tvec, rvec, offset)
+            w, x, y, z = rvec_to_quaternion(rvec)
+            pose = Pose()
+            pose.position.x    = float(p[0])
+            pose.position.y    = float(p[1])
+            pose.position.z    = float(p[2])
+            pose.orientation.w = w
+            pose.orientation.x = x
+            pose.orientation.y = y
+            pose.orientation.z = z
+            corrected_pose_msg.poses.append(pose)
+
+        writer.write(
+            CORRECTED_POSES_TOPIC,
+            serialize_message(corrected_pose_msg),
+            t_ns,
+        )
+
+        # ── /aruco/sonar_object_distance ──────────────────────────────────────
+        dist_msg = Float64()
+        if has_sonar and has_object:
+            both_detected += 1
+            t_s, r_s = poses[sonar_marker_id]
+            t_o, r_o = poses[object_marker_id]
+            p_s = corrected_position(t_s, r_s, sonar_offset)
+            p_o = corrected_position(t_o, r_o, object_offset)
+            dist_msg.data = float(np.linalg.norm(p_s - p_o))
+        else:
+            dist_msg.data = -1.0   # sentinel: one or both markers not visible
+
+        writer.write(
+            SONAR_OBJECT_DISTANCE_TOPIC,
+            serialize_message(dist_msg),
+            t_ns,
+        )
 
     return total_frames, both_detected
 
@@ -215,14 +287,15 @@ def main():
     parser = argparse.ArgumentParser(
         description=(
             "Apply static tag→component offsets to ArUco poses and write "
-            "corrected sonar-object distances to CSV."
+            "corrected MCAP bags with all original topics plus "
+            "/aruco/corrected_poses and /aruco/sonar_object_distance."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--bags_dir",
         default="/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr9_corrected_bags",
-        help="Directory containing corrected rosbag2 sub-folders.",
+        help="Directory containing corrected rosbag2 sub-folders (input).",
     )
     parser.add_argument(
         "--calibration",
@@ -232,8 +305,8 @@ def main():
     )
     parser.add_argument(
         "--output_dir",
-        default="/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr9_corrected_distances",
-        help="Directory where per-bag CSVs are written.",
+        default="/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr9_final_bags",
+        help="Directory where output bag sub-folders are written.",
     )
     parser.add_argument(
         "--marker_size", type=float, default=0.15,
@@ -244,6 +317,11 @@ def main():
         default=(
             "/home/aki/auv_ws/src/sonar_camera_logger/config/aruco_detector_parameters.yaml"
         ),
+    )
+    parser.add_argument(
+        "--camera_frame",
+        default="camera",
+        help="frame_id written into corrected PoseArray headers.",
     )
     parser.add_argument(
         "--sonar_marker_id", type=int, default=1,
@@ -282,7 +360,7 @@ def main():
     print("Calibration:")
     print(f"  fx={camera_matrix[0,0]:.4f}  fy={camera_matrix[1,1]:.4f}")
     print(f"  cx={camera_matrix[0,2]:.4f}  cy={camera_matrix[1,2]:.4f}")
-    print(f"Marker assignments:")
+    print("Marker assignments:")
     print(f"  sonar  → ID {args.sonar_marker_id:2d}  offset {sonar_offset.tolist()} m (ENU)")
     print(f"  object → ID {args.object_marker_id:2d}  offset {object_offset.tolist()} m (ENU)")
 
@@ -314,20 +392,30 @@ def main():
     summary = []
     for bag_dir in bag_dirs:
         name = bag_dir.name
-        out_csv = os.path.join(args.output_dir, f"{name}.csv")
+        out_bag = os.path.join(args.output_dir, name)
         print(f"[{name}]", flush=True)
+
+        if os.path.exists(out_bag):
+            print(f"  already exists — skipping (remove to reprocess)\n")
+            summary.append({"bag": name, "total_frames": "?",
+                            "both_tags_frames": "?", "rate_pct": "?",
+                            "status": "skipped"})
+            continue
+
         try:
             total, both = process_bag(
                 str(bag_dir), detector, camera_matrix, dist_coeffs,
                 args.marker_size,
                 args.sonar_marker_id, args.object_marker_id,
                 sonar_offset, object_offset,
-                out_csv,
+                out_bag,
+                args.camera_frame,
             )
             rate = 100.0 * both / max(total, 1)
-            print(f"  {total} frames | {both} with both tags ({rate:.1f}%) → {out_csv}")
+            print(f"  {total} aruco frames | {both} with both tags ({rate:.1f}%) → {out_bag}\n")
             summary.append({"bag": name, "total_frames": total,
-                            "both_tags_frames": both, "rate_pct": f"{rate:.1f}", "status": "ok"})
+                            "both_tags_frames": both, "rate_pct": f"{rate:.1f}",
+                            "status": "ok"})
         except Exception as exc:
             import traceback
             traceback.print_exc()
@@ -344,7 +432,7 @@ def main():
         w.writeheader()
         w.writerows(summary)
 
-    print(f"\nDone.  Summary → {summary_path}")
+    print(f"Done.  Summary → {summary_path}")
 
 
 if __name__ == "__main__":

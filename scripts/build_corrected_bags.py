@@ -37,6 +37,7 @@ SONAR_TOPICS = {"/sonar_3d/pointcloud_intensity", "/sonar_3d/strength_image"}
 ARUCO_IMAGE_TOPIC = "/aruco/image_debug"
 ARUCO_POSES_TOPIC = "/aruco/poses"
 ARUCO_DISTANCES_TOPIC = "/aruco/distances"
+ARUCO_IDS_TOPIC = "/aruco/ids"
 
 # Topics written to every output bag (order determines create_topic calls)
 OUTPUT_TOPICS = [
@@ -45,6 +46,7 @@ OUTPUT_TOPICS = [
     ("/aruco/image_debug",             "sensor_msgs/msg/Image"),
     ("/aruco/poses",                   "geometry_msgs/msg/PoseArray"),
     ("/aruco/distances",               "std_msgs/msg/Float64MultiArray"),
+    ("/aruco/ids",                     "std_msgs/msg/Int32MultiArray"),
 ]
 
 
@@ -103,6 +105,7 @@ def build_corrected_bag(
     from geometry_msgs.msg import Pose, PoseArray
     from std_msgs.msg import (
         Float64MultiArray,
+        Int32MultiArray,
         MultiArrayDimension,
         MultiArrayLayout,
     )
@@ -176,9 +179,8 @@ def build_corrected_bag(
             pose_msg.header.stamp.nanosec = nanosec
             pose_msg.header.frame_id      = camera_frame
             writer.write(ARUCO_POSES_TOPIC,     serialize_message(pose_msg), t_ns)
-
-            dist_msg = Float64MultiArray()
-            writer.write(ARUCO_DISTANCES_TOPIC, serialize_message(dist_msg), t_ns)
+            writer.write(ARUCO_DISTANCES_TOPIC, serialize_message(Float64MultiArray()), t_ns)
+            writer.write(ARUCO_IDS_TOPIC,       serialize_message(Int32MultiArray()), t_ns)
             continue
 
         detect_frames += 1
@@ -230,6 +232,11 @@ def build_corrected_bag(
         )
         dist_msg.data = dist_data
         writer.write(ARUCO_DISTANCES_TOPIC, serialize_message(dist_msg), t_ns)
+
+        # ── Int32MultiArray: marker IDs in the same order as PoseArray ────────
+        ids_msg = Int32MultiArray()
+        ids_msg.data = [int(i) for i in ids_flat]
+        writer.write(ARUCO_IDS_TOPIC, serialize_message(ids_msg), t_ns)
 
     return total_frames, detect_frames
 

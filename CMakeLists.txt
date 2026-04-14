@@ -121,6 +121,7 @@ install(DIRECTORY launch/
 install(PROGRAMS
   scripts/sonar_driver.py
   scripts/sonar_camera_fusion.py
+  scripts/aruco_tf_publisher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

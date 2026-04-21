@@ -11,10 +11,12 @@ import rclpy.executors
 import wlsonar
 import wlsonar.range_image_protocol as rip
 from builtin_interfaces.msg import Time
+from geometry_msgs.msg import TransformStamped
 from rclpy.node import Node
 from sensor_msgs.msg import Image, PointCloud2, PointField
 from sensor_msgs_py import point_cloud2
 from std_msgs.msg import Header
+from tf2_ros import StaticTransformBroadcaster
 
 
 class SonarDriver(Node):
@@ -26,6 +28,16 @@ class SonarDriver(Node):
 
         self.sonar_ip = "192.168.194.96"
         self.frame_id = "sonar_link"
+
+        # The sonar head is the world origin — publish a static identity TF
+        # so every other frame can reference "world" in RViz / TF tree.
+        _static_br = StaticTransformBroadcaster(self)
+        _world_tf = TransformStamped()
+        _world_tf.header.stamp = self.get_clock().now().to_msg()
+        _world_tf.header.frame_id = "world"
+        _world_tf.child_frame_id = self.frame_id
+        _world_tf.transform.rotation.w = 1.0  # identity rotation
+        _static_br.sendTransform(_world_tf)
 
         self.publisher_pointcloud = self.create_publisher(
             PointCloud2, "/sonar_3d/pointcloud", 10

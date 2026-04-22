@@ -1,0 +1,29 @@
+aruco_tf_publisher:
+  ros__parameters:
+
+    # ── Marker IDs ────────────────────────────────────────────────────────────
+    sonar_aruco_id: 1      # ArUco ID printed on the sonar mount marker
+    floater_aruco_id: 0    # ArUco ID printed on the floater marker
+
+    # Outlier filter: drop frames where rotation jumps more than this in one step
+    max_rotation_jump_deg: 30.0
+
+    # ── Static: sonar_link → sonar_aruco ─────────────────────────────────────
+    # Rigid offset from the sonar transducer head to the centre of its ArUco marker.
+    # Measure these on data collection day and fill them in (metres / degrees).
+    sonar_aruco_offset_x: 0.0
+    sonar_aruco_offset_y: 0.0
+    sonar_aruco_offset_z: 0.0
+    sonar_aruco_offset_roll_deg: 0.0
+    sonar_aruco_offset_pitch_deg: 0.0
+    sonar_aruco_offset_yaw_deg: 0.0
+
+    # ── Static: floater_aruco → object_center ────────────────────────────────
+    # Rigid offset from the floater ArUco marker centre to the centre of the object.
+    # Measure these on data collection day and fill them in (metres / degrees).
+    object_center_offset_x: 0.0
+    object_center_offset_y: 0.0
+    object_center_offset_z: 0.0
+    object_center_offset_roll_deg: 0.0
+    object_center_offset_pitch_deg: 0.0
+    object_center_offset_yaw_deg: 0.0

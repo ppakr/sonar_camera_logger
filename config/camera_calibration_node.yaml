@@ -20,4 +20,4 @@ camera_calibration_node:
     min_frames: 20           # minimum good captures before calibration runs
 
     # ── Output — overwrites the file used by aruco_distance_node ─────────────
-    calibration_output_file: /home/aki/auv_ws/src/sonar_camera_logger/config/calibration_parameters.yaml
+    calibration_output_file: /home/aki/auv_ws/src/sonar_camera_logger/config/microsoft_livecam_hd3000.yaml

@@ -50,35 +50,6 @@ add_custom_command(
 
 add_custom_target(wl_proto_gen DEPENDS "${PROTO_PB_CC}" "${PROTO_PB_H}")
 
-# ── sonar_driver executable ───────────────────────────────────────────────────
-add_executable(sonar_driver
-  src/sonar_driver.cpp
-  "${PROTO_PB_CC}"
-)
-add_dependencies(sonar_driver wl_proto_gen)
-
-target_include_directories(sonar_driver PRIVATE
-  "${PROTO_GEN_DIR}"               # generated .pb.h lives here
-  ${Protobuf_INCLUDE_DIRS}
-  ${SNAPPY_INCLUDE_DIRS}
-)
-
-target_link_libraries(sonar_driver
-  protobuf::libprotobuf
-  ${SNAPPY_LIBRARIES}
-  CURL::libcurl
-  ZLIB::ZLIB
-)
-
-ament_target_dependencies(sonar_driver
-  rclcpp
-  sensor_msgs
-  std_msgs
-)
-
-install(TARGETS sonar_driver
-  DESTINATION lib/${PROJECT_NAME}
-)
 
 # ── aruco_distance_node ───────────────────────────────────────────────────────
 add_executable(aruco_distance_node src/aruco_detection.cpp)

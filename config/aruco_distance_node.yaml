@@ -11,5 +11,5 @@ aruco_distance_node:
     camera_frame: camera_optical_frame
 
     # ── Calibration files (OpenCV FileStorage YAML format, same as lab1) ──────
-    calibration_file: /home/aki/auv_ws/src/sonar_camera_logger/config/calibration_parameters.yaml
+    calibration_file: /home/aki/auv_ws/src/sonar_camera_logger/config/microsoft_livecam_hd3000.yaml
     detector_params_file: /home/aki/auv_ws/src/sonar_camera_logger/config/aruco_detector_parameters.yaml

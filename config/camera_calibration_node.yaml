@@ -13,8 +13,8 @@ camera_calibration_node:
     # ── GridBoard geometry — adjust to your printed board ─────────────────────
     rows: 5                  # number of marker rows on the board
     cols: 7                  # number of marker columns on the board
-    marker_length: 0.052      # side length of one marker in metres
-    marker_separation: 0.014  # gap between adjacent markers in metres
+    marker_length: 0.03      # side length of one marker in metres
+    marker_separation: 0.01  # gap between adjacent markers in metres
 
     # ── Calibration settings ──────────────────────────────────────────────────
     min_frames: 20           # minimum good captures before calibration runs

@@ -7,7 +7,7 @@ aruco_distance_node:
 
     # ── ArUco detector ────────────────────────────────────────────────────────
     # Dictionary is fixed to DICT_4X4_50 in code (matches printed markers IDs 0–4)
-    marker_size: 0.15      # physical side length of printed marker in metres
+    marker_size: 0.16      # physical side length of printed marker in metres
     camera_frame: camera_optical_frame
 
     # ── Calibration files (OpenCV FileStorage YAML format, same as lab1) ──────

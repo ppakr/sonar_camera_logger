@@ -1,53 +1,42 @@
 #!/usr/bin/env python3
 """
-Build TF-tree MCAP bags from corrected wet-lab bags.
+Re-process wet-lab bags: re-run ArUco solvePnP with a new calibration and rebuild TF.
 
-TF Tree (output)
+TF Tree (output) — matches the live sonar_camera.launch.py tree
 ----------------
-    world  (= sonar_head, the sonar transducer position)
-        └── sonar_tag          [/tf_static]  fixed rigid offset
-                └── object_tag [/tf]         dynamic — updated each frame both tags visible
-                        └── object_center    [/tf_static]  fixed rigid offset
+    world  (= sonar_link = sonar transducer position, identity)
+        └── sonar_link         [/tf_static]  identity — world IS sonar_link
+                └── sonar_aruco    [/tf_static]  fixed rigid offset (sonar_offset)
+                        └── floater_aruco [/tf]  dynamic — updated each frame both tags visible
+                                └── object_center [/tf_static]  fixed rigid offset (object_offset)
 
-All transforms are expressed parent → child (ROS tf2 convention):
-  transform.translation = position of child origin in parent frame
-  transform.rotation    = rotation from child axes to parent axes
+Original /tf and /tf_static from the input bag are NOT passed through — they are
+replaced entirely by the freshly computed transforms above.
 
-Dynamic transform derivation (sonar_tag → object_tag)
-------------------------------------------------------
+Dynamic transform derivation (sonar_aruco → floater_aruco)
+----------------------------------------------------------
 Camera gives us (via solvePnP) for each detected tag:
-    T_cam_sonar_tag :  p_cam = R_s @ p_stag + tvec_s
-    T_cam_obj_tag   :  p_cam = R_o @ p_otag + tvec_o
+    T_cam_sonar_aruco :  p_cam = R_s @ p_s + tvec_s
+    T_cam_floater_aruco: p_cam = R_o @ p_o + tvec_o
 
-Inverse of T_cam_sonar_tag:
-    T_sonar_tag_cam :  p_stag = R_s^T @ (p_cam − tvec_s)
-                            R = R_s^T,   t = −R_s^T @ tvec_s
-
-Compose to get T_sonar_tag_obj_tag = T_sonar_tag_cam ∘ T_cam_obj_tag:
+Relative transform in sonar_aruco marker local frame:
     R = R_s^T @ R_o
     t = R_s^T @ (tvec_o − tvec_s)
 
-Static transforms
------------------
-    world → sonar_tag:
-        sonar_offset = position of sonar_head in sonar_tag ENU frame
-        → sonar_tag is at −sonar_offset in world (ENU-aligned, identity rotation)
-    object_tag → object_center:
-        object_offset = position of object_center in object_tag ENU frame  (direct)
-
 New topics written into every output bag
 -----------------------------------------
-    /tf_static   tf2_msgs/msg/TFMessage   two static transforms (once at t=0)
-    /tf          tf2_msgs/msg/TFMessage   sonar_tag→object_tag (per-frame, both visible)
+    /tf_static   tf2_msgs/msg/TFMessage   three static transforms (once, at first message)
+    /tf          tf2_msgs/msg/TFMessage   sonar_aruco→floater_aruco (per-frame, both visible)
     /aruco/sonar_object_distance   std_msgs/msg/Float64
-                 Euclidean distance sonar_head → object_center in world frame.
+                 Euclidean distance sonar_head → object_center (metres).
                  −1.0 when either marker is not visible.
 
 Usage
 -----
     source /home/aki/auv_ws/install/setup.bash
     python3 apply_frame_corrections.py [--help]
-    python3 apply_frame_corrections.py --bag rosbag2_2026_04_09-14_34_35
+    python3 apply_frame_corrections.py --bags_dir ~/wetlab_raw --output_dir ~/wetlab_processed
+    python3 apply_frame_corrections.py --bags_dir ~/wetlab_raw --bag cylinder_plastic --output_dir ~/wetlab_processed
 """
 
 import argparse
@@ -62,7 +51,7 @@ import numpy as np
 
 # ── Topic names ───────────────────────────────────────────────────────────────
 
-ARUCO_IMAGE_TOPIC = "/aruco/image_debug"
+ARUCO_IMAGE_TOPIC = "/aruco/image_raw"
 TF_STATIC_TOPIC = "/tf_static"
 TF_TOPIC = "/tf"
 DIST_TOPIC = "/aruco/sonar_object_distance"
@@ -115,12 +104,13 @@ def process_bag(
     marker_size: float,
     sonar_marker_id: int,
     object_marker_id: int,
-    sonar_offset: np.ndarray,  # sonar_tag → sonar_head,  in tag ENU frame
-    object_offset: np.ndarray,  # object_tag → object_center, in tag ENU frame
+    sonar_offset: np.ndarray,  # sonar_link → sonar_aruco translation (metres)
+    object_offset: np.ndarray,  # floater_aruco → object_center translation (metres)
     output_bag_dir: str,
     world_frame: str = "world",
-    sonar_tag_frame: str = "sonar_tag",
-    object_tag_frame: str = "object_tag",
+    sonar_link_frame: str = "sonar_link",
+    sonar_tag_frame: str = "sonar_aruco",
+    object_tag_frame: str = "floater_aruco",
     object_center_frame: str = "object_center",
 ):
     """
@@ -146,17 +136,16 @@ def process_bag(
     ).reshape(4, 1, 3)
 
     # ── Pre-compute static transforms ─────────────────────────────────────────
-    # world (sonar_head) → sonar_tag
-    #   sonar_offset = position of sonar_HEAD in sonar_TAG's ENU frame
-    #   → sonar_tag origin is at (−sonar_offset) in the world (sonar_head) frame
-    #   Orientation: identity — both frames share the same ENU orientation
-    t_world_sonar_tag = -sonar_offset  # e.g. [0, −0.05,  0.70]
-    R_world_sonar_tag = np.eye(3)
+    # Roll 180° around x: flips z-axis so both sonar_aruco and object_center
+    # have +z pointing downward (FRD convention), matching the sonar point cloud.
+    R_roll_180 = np.array([
+        [1.,  0.,  0.],
+        [0., -1.,  0.],
+        [0.,  0., -1.],
+    ])
 
-    # object_tag → object_center
-    #   object_offset = position of object_CENTER in object_TAG's ENU frame → direct
-    t_obj_tag_obj_ctr = object_offset  # e.g. [0,  0.00, −0.15]
-    R_obj_tag_obj_ctr = np.eye(3)
+    t_obj_tag_obj_ctr = object_offset
+    R_obj_tag_obj_ctr = R_roll_180
 
     # ── Reader ────────────────────────────────────────────────────────────────
     reader = rosbag2_py.SequentialReader()
@@ -173,7 +162,11 @@ def process_bag(
         rosbag2_py.ConverterOptions("cdr", "cdr"),
     )
 
-    for idx, tm in enumerate(input_topic_meta):
+    # Topics we recompute from scratch — drop originals to avoid duplicates.
+    REPLACED_TOPICS = {TF_STATIC_TOPIC, TF_TOPIC, DIST_TOPIC}
+
+    passthrough_topics = [tm for tm in input_topic_meta if tm.name not in REPLACED_TOPICS]
+    for idx, tm in enumerate(passthrough_topics):
         writer.create_topic(
             rosbag2_py.TopicMetadata(
                 id=idx,
@@ -183,7 +176,7 @@ def process_bag(
             )
         )
 
-    base_id = len(input_topic_meta)
+    base_id = len(passthrough_topics)
     for extra_idx, (tname, ttype) in enumerate(
         [
             (TF_STATIC_TOPIC, "tf2_msgs/msg/TFMessage"),
@@ -207,35 +200,32 @@ def process_bag(
     while reader.has_next():
         topic, data, t_ns = reader.read_next()
 
-        # Pass through all original messages unchanged
-        writer.write(topic, data, t_ns)
+        # Pass through all original messages EXCEPT /tf and /tf_static which we recompute.
+        if topic not in (TF_STATIC_TOPIC, TF_TOPIC):
+            writer.write(topic, data, t_ns)
 
         sec = int(t_ns // 1_000_000_000)
         nanosec = int(t_ns % 1_000_000_000)
 
-        # Write static TF once at the timestamp of the very first message
+        # Write three static TFs once at the timestamp of the very first message.
         if not static_written:
-            # Write static link from world (sonar_head) → sonar_tag, and object_tag → object_center
+            # world → sonar_link  (identity: the sonar transducer IS the world origin)
             ts1 = make_transform_stamped(
-                world_frame,
-                sonar_tag_frame,
-                t_world_sonar_tag,
-                R_world_sonar_tag,
-                sec,
-                nanosec,
+                world_frame, sonar_link_frame, np.zeros(3), np.eye(3), sec, nanosec
             )
+            # sonar_link → sonar_aruco  (rigid offset + roll 180° to flip z)
             ts2 = make_transform_stamped(
-                object_tag_frame,
-                object_center_frame,
-                t_obj_tag_obj_ctr,
-                R_obj_tag_obj_ctr,
-                sec,
-                nanosec,
+                sonar_link_frame, sonar_tag_frame, sonar_offset, R_roll_180, sec, nanosec
+            )
+            # floater_aruco → object_center  (rigid offset measured on setup day)
+            ts3 = make_transform_stamped(
+                object_tag_frame, object_center_frame,
+                t_obj_tag_obj_ctr, R_obj_tag_obj_ctr, sec, nanosec,
             )
             statics = TFMessage()
-            statics.transforms = [ts1, ts2]
+            statics.transforms = [ts1, ts2, ts3]
             writer.write(TF_STATIC_TOPIC, serialize_message(statics), t_ns)
-            # static_written = True
+            static_written = True
 
         # Only ArUco image frames carry pose information
         if topic != ARUCO_IMAGE_TOPIC:
@@ -259,7 +249,6 @@ def process_bag(
                     corners[i],
                     camera_matrix,
                     dist_coeffs,
-                    flags=cv2.SOLVEPNP_IPPE_SQUARE,
                 )
                 if ok:
                     R_mat, _ = cv2.Rodrigues(rvec.flatten())
@@ -295,16 +284,12 @@ def process_bag(
             writer.write(TF_TOPIC, serialize_message(dyn_tf), t_ns)
 
             # ── Distance: sonar_head (world origin) → object_center ───────────
-            # T_world_object_tag:
-            #   R = R_world_sonar_tag @ R_st_ot  = I @ R_st_ot
-            #   t = t_world_sonar_tag + R_world_sonar_tag @ t_st_ot
-            #     = t_world_sonar_tag + t_st_ot
-            R_world_obj_tag = R_st_ot  # R_world_sonar_tag = I
-            t_world_obj_tag = t_world_sonar_tag + t_st_ot
-
-            # object_center in world:
-            #   p = t_world_obj_tag + R_world_obj_tag @ object_offset
-            p_obj_center_world = t_world_obj_tag + R_world_obj_tag @ object_offset
+            # Full TF chain: world → sonar_link → sonar_aruco → floater_aruco → object_center
+            # t_st_ot is in sonar_aruco marker frame (y-up, z toward camera).
+            # Must rotate through R_roll_180 before adding to sonar_offset (world/FRD frame).
+            t_world_floater = sonar_offset + R_roll_180 @ t_st_ot
+            R_world_floater = R_roll_180 @ R_st_ot
+            p_obj_center_world = t_world_floater + R_world_floater @ object_offset
             dist_val = float(np.linalg.norm(p_obj_center_world))
 
         dist_msg = Float64()
@@ -320,17 +305,16 @@ def process_bag(
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Build TF-tree MCAP bags. "
-            "Writes /tf_static (world→sonar_tag, object_tag→object_center), "
-            "/tf (sonar_tag→object_tag, dynamic), "
-            "and /aruco/sonar_object_distance."
+            "Re-process bags with a new camera calibration: re-runs ArUco solvePnP and "
+            "rebuilds /tf_static (world→sonar_link→sonar_aruco, floater_aruco→object_center), "
+            "/tf (sonar_aruco→floater_aruco, dynamic), and /aruco/sonar_object_distance."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--bags_dir",
-        default="/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr9/",
-        help="Directory of corrected rosbag2 sub-folders (input from build_corrected_bags.py).",
+        required=True,
+        help="Directory whose sub-folders are rosbag2 bags (each contains metadata.yaml).",
     )
     parser.add_argument(
         "--calibration",
@@ -340,13 +324,13 @@ def main():
     )
     parser.add_argument(
         "--output_dir",
-        default="/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr9_final_bags",
-        help="Directory where output bag sub-folders are written.",
+        required=True,
+        help="Directory where reprocessed bag sub-folders are written.",
     )
     parser.add_argument(
         "--marker_size",
         type=float,
-        default=0.15,
+        default=0.16,
         help="Physical side length of one ArUco marker in metres.",
     )
     parser.add_argument(
@@ -369,21 +353,24 @@ def main():
         nargs=3,
         type=float,
         metavar=("X", "Y", "Z"),
-        default=[0.0, 0.05, -0.70],
-        help="Offset sonar_tag → sonar_head in tag ENU frame (metres).",
+        default=[0.12, 0.05, -0.75],
+        help="Offset sonar_link → sonar_aruco in sonar_link frame (metres). "
+             "z is negative because the ArUco is above the sonar (FRD: +z=down).",
     )
     parser.add_argument(
         "--object_offset",
         nargs=3,
         type=float,
         metavar=("X", "Y", "Z"),
-        default=[0.0, 0.0, -0.15],
-        help="Offset object_tag → object_center in tag ENU frame (metres).",
+        default=[0.0, 0.0, -0.77],
+        help="Offset floater_aruco → object_center in tag frame (metres). "
+             "z is negative because object hangs below the floater (floater_aruco +z=up).",
     )
     # TF frame name overrides
     parser.add_argument("--world_frame", default="world")
-    parser.add_argument("--sonar_tag_frame", default="sonar_tag")
-    parser.add_argument("--object_tag_frame", default="object_tag")
+    parser.add_argument("--sonar_link_frame", default="sonar_link")
+    parser.add_argument("--sonar_tag_frame", default="sonar_aruco")
+    parser.add_argument("--object_tag_frame", default="floater_aruco")
     parser.add_argument("--object_center_frame", default="object_center")
     parser.add_argument(
         "--bag", default=None, help="Process only this bag name; omit to process all."
@@ -408,9 +395,10 @@ def main():
     print(f"  fx={camera_matrix[0,0]:.4f}  fy={camera_matrix[1,1]:.4f}")
     print(f"  cx={camera_matrix[0,2]:.4f}  cy={camera_matrix[1,2]:.4f}")
     print("TF tree:")
+    print(f"  {args.world_frame} → {args.sonar_link_frame}  identity  [static]")
     print(
-        f"  {args.world_frame} → {args.sonar_tag_frame}  "
-        f"offset {(-sonar_offset).tolist()} m  [static]"
+        f"  {args.sonar_link_frame} → {args.sonar_tag_frame}  "
+        f"offset {sonar_offset.tolist()} m  [static]"
     )
     print(f"  {args.sonar_tag_frame} → {args.object_tag_frame}  [dynamic]")
     print(
@@ -477,6 +465,7 @@ def main():
                 object_offset,
                 out_bag,
                 world_frame=args.world_frame,
+                sonar_link_frame=args.sonar_link_frame,
                 sonar_tag_frame=args.sonar_tag_frame,
                 object_tag_frame=args.object_tag_frame,
                 object_center_frame=args.object_center_frame,

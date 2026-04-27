@@ -76,30 +76,43 @@ ALL_TOPICS = [SONAR_PC_TOPIC, STRENGTH_TOPIC, CAMERA_TOPIC,
 
 # TF frame name → Rerun entity path.
 # The path structure encodes the TF hierarchy so Rerun composes transforms
-# automatically:  world → world/sonar_tag → world/sonar_tag/object_tag → …
+# automatically:  world → world/sonar_link → world/sonar_link/sonar_aruco → …
 TF_ENTITY_PATHS = {
-    "world":         "frames/world",
-    "sonar_tag":     "frames/world/sonar_tag",
-    "object_tag":    "frames/world/sonar_tag/object_tag",
-    "object_center": "frames/world/sonar_tag/object_tag/object_center",
+    "world":          "frames/world",
+    "sonar_link":     "frames/world/sonar_link",
+    "sonar_aruco":    "frames/world/sonar_link/sonar_aruco",
+    "floater_aruco":  "frames/world/sonar_link/sonar_aruco/floater_aruco",
+    "object_center":  "frames/world/sonar_link/sonar_aruco/floater_aruco/object_center",
+    # legacy names from earlier bags
+    "sonar_tag":      "frames/world/sonar_tag",
+    "object_tag":     "frames/world/sonar_tag/object_tag",
 }
 TF_AXIS_LENGTHS = {
-    "world":         0.20,
-    "sonar_tag":     0.12,
-    "object_tag":    0.12,
-    "object_center": 0.08,
+    "world":          0.20,
+    "sonar_link":     0.15,
+    "sonar_aruco":    0.12,
+    "floater_aruco":  0.12,
+    "object_center":  0.08,
+    "sonar_tag":      0.12,
+    "object_tag":     0.12,
 }
 TF_POINT_COLOURS = {
-    "world":         [255, 220,  50, 255],   # yellow   — sonar head
-    "sonar_tag":     [255, 140,  60, 255],   # orange   — sonar tag
-    "object_tag":    [100, 220, 100, 255],   # lt-green — object tag
-    "object_center": [ 50, 200,  50, 255],   # green    — object centre
+    "world":          [255, 220,  50, 255],   # yellow        — sonar head / world
+    "sonar_link":     [255, 180,  20, 255],   # dark-yellow   — sonar transducer
+    "sonar_aruco":    [255, 140,  60, 255],   # orange        — sonar ArUco tag
+    "floater_aruco":  [100, 220, 100, 255],   # lt-green      — floater ArUco tag
+    "object_center":  [ 50, 200,  50, 255],   # green         — object centre
+    "sonar_tag":      [255, 140,  60, 255],
+    "object_tag":     [100, 220, 100, 255],
 }
 TF_POINT_RADII = {
-    "world":         0.040,
-    "sonar_tag":     0.020,
-    "object_tag":    0.020,
-    "object_center": 0.030,
+    "world":          0.040,
+    "sonar_link":     0.030,
+    "sonar_aruco":    0.020,
+    "floater_aruco":  0.020,
+    "object_center":  0.030,
+    "sonar_tag":      0.020,
+    "object_tag":     0.020,
 }
 
 
@@ -408,6 +421,10 @@ def main():
     # ── Initialise Rerun ──────────────────────────────────────────────────────
     rr.init("wl_wetlab_sonar", spawn=(args.save is None))
     rr.send_blueprint(make_blueprint())
+
+    # Tell Rerun the scene uses FRD (Forward-Right-Down) coordinates so the
+    # 3D view orients correctly (sonar_link is FRD: +x forward, +z down).
+    rr.log("/", rr.ViewCoordinates.FRD, static=True)
 
     if args.save:
         rr.save(args.save)

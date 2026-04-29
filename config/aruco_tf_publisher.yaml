@@ -11,7 +11,7 @@ aruco_tf_publisher:
     # ── Static: sonar_link → sonar_aruco ─────────────────────────────────────
     # Rigid offset from the sonar transducer head to the centre of its ArUco marker.
     # Measure these on data collection day and fill them in (metres / degrees).
-    sonar_aruco_offset_x: 0.12
+    sonar_aruco_offset_x: -0.12
     sonar_aruco_offset_y: -0.05
     sonar_aruco_offset_z: -0.75
     sonar_aruco_offset_roll_deg: 180.0
@@ -19,9 +19,9 @@ aruco_tf_publisher:
     sonar_aruco_offset_yaw_deg: 0.0
 
     # ── Static: floater_aruco → object_center ────────────────────────────────
-    # Rigid offset from the floater ArUco marker centre to the centre of the object.
+    # Rigid offset from thed   floater ArUco marker centre to the centre of the object.
     # Measure these on data collection day and fill them in (metres / degrees).
-    object_center_offset_x: 0.1
+    object_center_offset_x: 0.0
     object_center_offset_y: 0.0
     object_center_offset_z: -0.77
     object_center_offset_roll_deg: 180.0

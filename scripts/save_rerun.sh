@@ -2,6 +2,7 @@
 set -eo pipefail
 
 RANGE=/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr22_range
+RRD_OUT=~/rrd_apr22_range
 VIZ=~/auv_ws/src/sonar_camera_logger/scripts/visualize_bags_rerun.py
 
 # colcon setup scripts use unbound variables — disable -u around the source
@@ -9,9 +10,11 @@ set +u
 source ~/auv_ws/install/setup.bash
 set -u
 
+mkdir -p "$RRD_OUT"
+
 for bag_dir in "$RANGE"/*/; do
   name=$(basename "$bag_dir")
-  rrd="$RANGE/${name}.rrd"
+  rrd="$RRD_OUT/${name}.rrd"
   if [ -f "$rrd" ]; then
     echo "[SKIP] $name"
     continue

@@ -4,7 +4,8 @@ Visualize wet lab sonar bags with Rerun.
 
 Logs per bag frame:
   sonar/pointcloud                — 3D point cloud coloured by intensity (hot colormap)
-  sonar/strength_image            — 2D sonar range image (raw sensor output)
+  sonar/strength_image            — 2D sonar strength bitmap (raw sensor output, uint8)
+  sonar/range_image               — 2D sonar range image (float32, metres; zeros = no return)
   camera/image                    — ArUco debug image (camera view)
   aruco/sonar_tag                 — ArUco tag origin frame on the sonar mount (orange dot + axes)
   aruco/sonar_tag/offset_arrow    — Arrow from sonar tag → sonar transducer (0.70 m)
@@ -37,7 +38,8 @@ Usage
 Topics consumed
 ---------------
   /sonar_3d/pointcloud_intensity  — PointCloud2 XYZI
-  /sonar_3d/strength_image        — Image (sonar 2D)
+  /sonar_3d/strength_image        — Image mono8 (sonar strength bitmap)
+  /sonar_3d/range_image           — Image 32FC1 (reconstructed range, metres)
   /aruco/image_debug              — Image (camera)
   /tf_static                      — TFMessage  (world→sonar_tag, object_tag→object_center)
   /tf                             — TFMessage  (sonar_tag→object_tag, dynamic)
@@ -66,12 +68,13 @@ MAT_COLOURS = {
 # Topics
 SONAR_PC_TOPIC  = "/sonar_3d/pointcloud_intensity"
 STRENGTH_TOPIC  = "/sonar_3d/strength_image"
+RANGE_IMG_TOPIC = "/sonar_3d/range_image"
 CAMERA_TOPIC    = "/aruco/image_debug"
 TF_STATIC_TOPIC = "/tf_static"
 TF_TOPIC        = "/tf"
 DIST_TOPIC      = "/aruco/sonar_object_distance"
 
-ALL_TOPICS = [SONAR_PC_TOPIC, STRENGTH_TOPIC, CAMERA_TOPIC,
+ALL_TOPICS = [SONAR_PC_TOPIC, STRENGTH_TOPIC, RANGE_IMG_TOPIC, CAMERA_TOPIC,
               TF_STATIC_TOPIC, TF_TOPIC, DIST_TOPIC]
 
 # TF frame name → Rerun entity path.
@@ -130,28 +133,40 @@ def decode_pc2(msg) -> np.ndarray:
         return np.empty((0, 4), dtype=np.float32)
 
     step = msg.point_step
-    raw  = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n, step)
-    fm   = {f.name: (f.offset,
-                     _PC2_NBYTES.get(f.datatype, 4),
-                     _PC2_DTYPE.get(f.datatype, np.float32))
-            for f in msg.fields}
+    # Avoid bytes(msg.data) copy — frombuffer works directly on bytes/array.array.
+    raw = np.frombuffer(msg.data, dtype=np.uint8)
+    fm  = {f.name: (f.offset, _PC2_DTYPE.get(f.datatype, np.float32))
+           for f in msg.fields}
 
-    def col(name):
+    out = np.empty((n, 4), dtype=np.float32)
+    for i, name in enumerate(("x", "y", "z", "intensity")):
         if name not in fm:
-            return np.zeros(n, dtype=np.float32)
-        off, nb, dt = fm[name]
-        arr = np.frombuffer(raw[:, off:off + nb].tobytes(), dtype=dt)
-        return arr.astype(np.float32)
+            out[:, i] = 0.0
+            continue
+        off, dt = fm[name]
+        itemsize = np.dtype(dt).itemsize
+        # Strided view: jump `step` bytes between elements — zero intermediate copy.
+        out[:, i] = raw.view(dt)[off // itemsize :: step // itemsize][:n]
 
-    pts = np.stack([col("x"), col("y"), col("z"), col("intensity")], axis=1)
-    return pts[np.all(np.isfinite(pts[:, :3]), axis=1)]
+    mask = np.all(np.isfinite(out[:, :3]), axis=1)
+    return out[mask]
 
 
 def decode_image(msg) -> np.ndarray:
     """sensor_msgs/Image → (H, W, C) uint8."""
-    arr = np.frombuffer(bytes(msg.data), dtype=np.uint8)
+    # Avoid bytes(msg.data) copy — frombuffer works directly on bytes/array.array.
+    arr = np.frombuffer(msg.data, dtype=np.uint8)
     channels = max(1, len(msg.data) // (msg.height * msg.width))
     return arr.reshape(msg.height, msg.width, channels)
+
+
+def decode_range_image(msg) -> np.ndarray:
+    """sensor_msgs/Image (32FC1) → (H, W) float32 in metres. Zeros = no return."""
+    arr = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
+    # Replace zeros with NaN so Rerun renders them as transparent (no false depth).
+    out = arr.copy()
+    out[out == 0.0] = np.nan
+    return out
 
 
 def quat_wxyz_to_matrix(w, x, y, z) -> np.ndarray:
@@ -189,7 +204,7 @@ def intensity_to_rgba(intensity: np.ndarray) -> np.ndarray:
 # ── Blueprint ─────────────────────────────────────────────────────────────────
 
 def make_blueprint() -> rrb.Blueprint:
-    """4-panel layout: 3-D sonar + TF | camera image / sonar image | distance plot."""
+    """Layout: 3-D view | camera / sonar images (strength + range) / distance plot."""
     return rrb.Blueprint(
         rrb.Horizontal(
             rrb.Spatial3DView(
@@ -202,9 +217,15 @@ def make_blueprint() -> rrb.Blueprint:
                     name="Camera",
                     origin="camera/image",
                 ),
-                rrb.Spatial2DView(
-                    name="Sonar Strength Image",
-                    origin="sonar/strength_image",
+                rrb.Horizontal(
+                    rrb.Spatial2DView(
+                        name="Sonar Strength Image",
+                        origin="sonar/strength_image",
+                    ),
+                    rrb.Spatial2DView(
+                        name="Sonar Range Image (m)",
+                        origin="sonar/range_image",
+                    ),
                 ),
                 rrb.TimeSeriesView(
                     name="Sonar-Object Distance (m)",
@@ -264,6 +285,7 @@ def log_bag(
                                   max(1, int(h * image_scale))))
 
     sonar_frame_idx = 0
+    range_frame_idx = 0
     while reader.has_next():
         topic, data, t_ns = reader.read_next()
 
@@ -287,6 +309,16 @@ def log_bag(
             if frame.shape[2] == 1:
                 frame = frame.squeeze(axis=2)
             rr.log("sonar/strength_image", rr.Image(maybe_resize(frame)))
+
+        elif topic == RANGE_IMG_TOPIC:
+            range_frame_idx += 1
+            if range_frame_idx % every_nth != 0:
+                continue
+            msg = deserialize_message(data, Image)
+            ri  = decode_range_image(msg)
+            # DepthImage renders float metre data with a perceptual depth colormap.
+            # NaN pixels (no sonar return) appear transparent.
+            rr.log("sonar/range_image", rr.DepthImage(ri, meter=1.0))
 
         elif topic == CAMERA_TOPIC:
             msg   = deserialize_message(data, Image)

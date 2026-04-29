@@ -369,6 +369,7 @@ def main() -> None:
         if not bags:
             print(f"No sub-directories found in {args.bags_dir}")
             sys.exit(1)
+        failed = []
         for name in bags:
             in_path = os.path.join(args.bags_dir, name)
             out_path = os.path.join(args.output_dir, name)
@@ -376,7 +377,20 @@ def main() -> None:
                 print(f"[SKIP] {name}  (output already exists)")
                 continue
             print(f"\n=== {name} ===")
-            process_bag(in_path, out_path, args.fov_h, args.fov_v)
+            try:
+                process_bag(in_path, out_path, args.fov_h, args.fov_v)
+            except Exception as exc:
+                print(f"  [ERROR] {name}: {exc}")
+                # Remove partial output so the bag can be retried cleanly
+                if os.path.exists(out_path):
+                    import shutil
+                    shutil.rmtree(out_path)
+                failed.append((name, exc))
+        if failed:
+            print(f"\n{'='*50}")
+            print(f"FAILED ({len(failed)}/{len(bags)}):")
+            for name, exc in failed:
+                print(f"  {name}: {exc}")
     else:
         # Single-bag mode
         if not args.output:

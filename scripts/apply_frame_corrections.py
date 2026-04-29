@@ -41,12 +41,14 @@ Usage
 
 import argparse
 import csv
+import math
 import os
 import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
+import yaml
 
 
 # ── Topic names ───────────────────────────────────────────────────────────────
@@ -55,6 +57,86 @@ ARUCO_IMAGE_TOPIC = "/aruco/image_raw"
 TF_STATIC_TOPIC = "/tf_static"
 TF_TOPIC = "/tf"
 DIST_TOPIC = "/aruco/sonar_object_distance"
+
+DEFAULT_TF_CONFIG = (
+    "/home/aki/auv_ws/src/sonar_camera_logger/config/aruco_tf_publisher.yaml"
+)
+
+
+# ── TF config (aruco_tf_publisher.yaml) ───────────────────────────────────────
+
+
+def rpy_to_matrix(roll_rad: float, pitch_rad: float, yaw_rad: float) -> np.ndarray:
+    """Roll-pitch-yaw (radians, ZYX extrinsic) → 3×3 rotation matrix.
+
+    Same convention as aruco_tf_publisher.py:rpy_to_quat — ensures the
+    static transforms produced here line up exactly with what the live
+    TF publisher would emit for the same YAML values.
+    """
+    cr, sr = math.cos(roll_rad), math.sin(roll_rad)
+    cp, sp = math.cos(pitch_rad), math.sin(pitch_rad)
+    cy, sy = math.cos(yaw_rad), math.sin(yaw_rad)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def load_tf_config(yaml_path: str):
+    """Load static frame offsets from aruco_tf_publisher.yaml.
+
+    Returns
+    -------
+    dict with keys:
+        sonar_offset       (np.ndarray, 3,)  metres, sonar_link → sonar_aruco
+        R_sonar_aruco      (np.ndarray, 3, 3) rotation, sonar_link → sonar_aruco
+        object_offset      (np.ndarray, 3,)  metres, floater_aruco → object_center
+        R_object_center    (np.ndarray, 3, 3) rotation, floater_aruco → object_center
+        sonar_aruco_id     (int)
+        floater_aruco_id   (int)
+    """
+    with open(yaml_path) as f:
+        doc = yaml.safe_load(f)
+    try:
+        params = doc["aruco_tf_publisher"]["ros__parameters"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"{yaml_path}: expected 'aruco_tf_publisher.ros__parameters' root"
+        ) from exc
+
+    def get(key, default=None, required=False):
+        if required and key not in params:
+            raise KeyError(f"{yaml_path}: missing required key '{key}'")
+        return params.get(key, default)
+
+    sonar_offset = np.array([
+        float(get("sonar_aruco_offset_x", 0.0)),
+        float(get("sonar_aruco_offset_y", 0.0)),
+        float(get("sonar_aruco_offset_z", 0.0)),
+    ])
+    R_sonar_aruco = rpy_to_matrix(
+        math.radians(float(get("sonar_aruco_offset_roll_deg", 0.0))),
+        math.radians(float(get("sonar_aruco_offset_pitch_deg", 0.0))),
+        math.radians(float(get("sonar_aruco_offset_yaw_deg", 0.0))),
+    )
+    object_offset = np.array([
+        float(get("object_center_offset_x", 0.0)),
+        float(get("object_center_offset_y", 0.0)),
+        float(get("object_center_offset_z", 0.0)),
+    ])
+    R_object_center = rpy_to_matrix(
+        math.radians(float(get("object_center_offset_roll_deg", 0.0))),
+        math.radians(float(get("object_center_offset_pitch_deg", 0.0))),
+        math.radians(float(get("object_center_offset_yaw_deg", 0.0))),
+    )
+    return {
+        "sonar_offset": sonar_offset,
+        "R_sonar_aruco": R_sonar_aruco,
+        "object_offset": object_offset,
+        "R_object_center": R_object_center,
+        "sonar_aruco_id": int(get("sonar_aruco_id", 1)),
+        "floater_aruco_id": int(get("floater_aruco_id", 0)),
+    }
 
 
 # ── TF helpers ────────────────────────────────────────────────────────────────
@@ -105,7 +187,9 @@ def process_bag(
     sonar_marker_id: int,
     object_marker_id: int,
     sonar_offset: np.ndarray,  # sonar_link → sonar_aruco translation (metres)
+    R_sonar_aruco: np.ndarray,  # sonar_link → sonar_aruco rotation
     object_offset: np.ndarray,  # floater_aruco → object_center translation (metres)
+    R_object_center: np.ndarray,  # floater_aruco → object_center rotation
     output_bag_dir: str,
     world_frame: str = "world",
     sonar_link_frame: str = "sonar_link",
@@ -134,18 +218,6 @@ def process_bag(
         ],
         dtype=np.float32,
     ).reshape(4, 1, 3)
-
-    # ── Pre-compute static transforms ─────────────────────────────────────────
-    # Roll 180° around x: flips z-axis so both sonar_aruco and object_center
-    # have +z pointing downward (FRD convention), matching the sonar point cloud.
-    R_roll_180 = np.array([
-        [1.,  0.,  0.],
-        [0., -1.,  0.],
-        [0.,  0., -1.],
-    ])
-
-    t_obj_tag_obj_ctr = object_offset
-    R_obj_tag_obj_ctr = R_roll_180
 
     # ── Reader ────────────────────────────────────────────────────────────────
     reader = rosbag2_py.SequentialReader()
@@ -213,14 +285,14 @@ def process_bag(
             ts1 = make_transform_stamped(
                 world_frame, sonar_link_frame, np.zeros(3), np.eye(3), sec, nanosec
             )
-            # sonar_link → sonar_aruco  (rigid offset + roll 180° to flip z)
+            # sonar_link → sonar_aruco  (rigid offset + rotation from aruco_tf_publisher.yaml)
             ts2 = make_transform_stamped(
-                sonar_link_frame, sonar_tag_frame, sonar_offset, R_roll_180, sec, nanosec
+                sonar_link_frame, sonar_tag_frame, sonar_offset, R_sonar_aruco, sec, nanosec
             )
-            # floater_aruco → object_center  (rigid offset measured on setup day)
+            # floater_aruco → object_center  (rigid offset + rotation from aruco_tf_publisher.yaml)
             ts3 = make_transform_stamped(
                 object_tag_frame, object_center_frame,
-                t_obj_tag_obj_ctr, R_obj_tag_obj_ctr, sec, nanosec,
+                object_offset, R_object_center, sec, nanosec,
             )
             statics = TFMessage()
             statics.transforms = [ts1, ts2, ts3]
@@ -285,10 +357,10 @@ def process_bag(
 
             # ── Distance: sonar_head (world origin) → object_center ───────────
             # Full TF chain: world → sonar_link → sonar_aruco → floater_aruco → object_center
-            # t_st_ot is in sonar_aruco marker frame (y-up, z toward camera).
-            # Must rotate through R_roll_180 before adding to sonar_offset (world/FRD frame).
-            t_world_floater = sonar_offset + R_roll_180 @ t_st_ot
-            R_world_floater = R_roll_180 @ R_st_ot
+            # t_st_ot is in sonar_aruco marker frame; rotate through R_sonar_aruco
+            # (from aruco_tf_publisher.yaml) to express it in the world/sonar_link frame.
+            t_world_floater = sonar_offset + R_sonar_aruco @ t_st_ot
+            R_world_floater = R_sonar_aruco @ R_st_ot
             p_obj_center_world = t_world_floater + R_world_floater @ object_offset
             dist_val = float(np.linalg.norm(p_obj_center_world))
 
@@ -340,31 +412,25 @@ def main():
         ),
     )
     parser.add_argument(
-        "--sonar_marker_id", type=int, default=1, help="ArUco ID on the sonar mount."
+        "--tf_config",
+        default=DEFAULT_TF_CONFIG,
+        help=(
+            "Path to aruco_tf_publisher.yaml. Provides static frame offsets "
+            "(sonar_link → sonar_aruco and floater_aruco → object_center, "
+            "translation + RPY) and the marker IDs."
+        ),
+    )
+    parser.add_argument(
+        "--sonar_marker_id",
+        type=int,
+        default=None,
+        help="Override sonar mount ArUco ID (defaults to value in --tf_config).",
     )
     parser.add_argument(
         "--object_marker_id",
         type=int,
-        default=0,
-        help="ArUco ID on the floating object.",
-    )
-    parser.add_argument(
-        "--sonar_offset",
-        nargs=3,
-        type=float,
-        metavar=("X", "Y", "Z"),
-        default=[0.12, 0.05, -0.75],
-        help="Offset sonar_link → sonar_aruco in sonar_link frame (metres). "
-             "z is negative because the ArUco is above the sonar (FRD: +z=down).",
-    )
-    parser.add_argument(
-        "--object_offset",
-        nargs=3,
-        type=float,
-        metavar=("X", "Y", "Z"),
-        default=[0.0, 0.0, -0.77],
-        help="Offset floater_aruco → object_center in tag frame (metres). "
-             "z is negative because object hangs below the floater (floater_aruco +z=up).",
+        default=None,
+        help="Override floater ArUco ID (defaults to value in --tf_config).",
     )
     # TF frame name overrides
     parser.add_argument("--world_frame", default="world")
@@ -388,22 +454,39 @@ def main():
     dist_coeffs = fs.getNode("distCoeffs").mat()
     fs.release()
 
-    sonar_offset = np.array(args.sonar_offset, dtype=np.float64)
-    object_offset = np.array(args.object_offset, dtype=np.float64)
+    # ── Static frame offsets (translation + rotation) from aruco_tf_publisher.yaml
+    try:
+        tf_cfg = load_tf_config(args.tf_config)
+    except (OSError, RuntimeError, KeyError) as exc:
+        print(f"ERROR: cannot load tf_config: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+    sonar_offset = tf_cfg["sonar_offset"]
+    R_sonar_aruco = tf_cfg["R_sonar_aruco"]
+    object_offset = tf_cfg["object_offset"]
+    R_object_center = tf_cfg["R_object_center"]
+    sonar_marker_id = (
+        args.sonar_marker_id if args.sonar_marker_id is not None else tf_cfg["sonar_aruco_id"]
+    )
+    object_marker_id = (
+        args.object_marker_id if args.object_marker_id is not None else tf_cfg["floater_aruco_id"]
+    )
 
     print("Calibration:")
     print(f"  fx={camera_matrix[0,0]:.4f}  fy={camera_matrix[1,1]:.4f}")
     print(f"  cx={camera_matrix[0,2]:.4f}  cy={camera_matrix[1,2]:.4f}")
+    print(f"TF config: {args.tf_config}")
+    print(f"  sonar_aruco_id={sonar_marker_id}  floater_aruco_id={object_marker_id}")
     print("TF tree:")
     print(f"  {args.world_frame} → {args.sonar_link_frame}  identity  [static]")
     print(
         f"  {args.sonar_link_frame} → {args.sonar_tag_frame}  "
-        f"offset {sonar_offset.tolist()} m  [static]"
+        f"t={sonar_offset.tolist()} m  R≠I={not np.allclose(R_sonar_aruco, np.eye(3))}  [static]"
     )
     print(f"  {args.sonar_tag_frame} → {args.object_tag_frame}  [dynamic]")
     print(
         f"  {args.object_tag_frame} → {args.object_center_frame}  "
-        f"offset {object_offset.tolist()} m  [static]"
+        f"t={object_offset.tolist()} m  R≠I={not np.allclose(R_object_center, np.eye(3))}  [static]"
     )
 
     # ── Detector ──────────────────────────────────────────────────────────────
@@ -459,10 +542,12 @@ def main():
                 camera_matrix,
                 dist_coeffs,
                 args.marker_size,
-                args.sonar_marker_id,
-                args.object_marker_id,
+                sonar_marker_id,
+                object_marker_id,
                 sonar_offset,
+                R_sonar_aruco,
                 object_offset,
+                R_object_center,
                 out_bag,
                 world_frame=args.world_frame,
                 sonar_link_frame=args.sonar_link_frame,

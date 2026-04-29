@@ -133,23 +133,22 @@ def decode_pc2(msg) -> np.ndarray:
         return np.empty((0, 4), dtype=np.float32)
 
     step = msg.point_step
-    # Avoid bytes(msg.data) copy — frombuffer works directly on bytes/array.array.
-    raw = np.frombuffer(msg.data, dtype=np.uint8)
-    fm  = {f.name: (f.offset, _PC2_DTYPE.get(f.datatype, np.float32))
-           for f in msg.fields}
+    raw  = np.frombuffer(bytes(msg.data), dtype=np.uint8).reshape(n, step)
+    fm   = {f.name: (f.offset,
+                     _PC2_NBYTES.get(f.datatype, 4),
+                     _PC2_DTYPE.get(f.datatype, np.float32))
+            for f in msg.fields}
 
-    out = np.empty((n, 4), dtype=np.float32)
-    for i, name in enumerate(("x", "y", "z", "intensity")):
+    def col(name):
         if name not in fm:
-            out[:, i] = 0.0
-            continue
-        off, dt = fm[name]
-        itemsize = np.dtype(dt).itemsize
-        # Strided view: jump `step` bytes between elements — zero intermediate copy.
-        out[:, i] = raw.view(dt)[off // itemsize :: step // itemsize][:n]
+            return np.zeros(n, dtype=np.float32)
+        off, nb, dt = fm[name]
+        return np.frombuffer(
+            np.ascontiguousarray(raw[:, off:off + nb]).tobytes(), dtype=dt
+        ).astype(np.float32)
 
-    mask = np.all(np.isfinite(out[:, :3]), axis=1)
-    return out[mask]
+    pts = np.stack([col("x"), col("y"), col("z"), col("intensity")], axis=1)
+    return pts[np.all(np.isfinite(pts[:, :3]), axis=1)]
 
 
 def decode_image(msg) -> np.ndarray:

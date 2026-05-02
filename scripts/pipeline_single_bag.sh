@@ -13,9 +13,12 @@
 set -eo pipefail
 
 # ── Paths (edit as needed) ────────────────────────────────────────────────────
+# RAW_DIR        : input bags (one subdir per recording session)
+# TF_DIR         : post-step-1 staging (TF-corrected only, no range image yet)
+# PROCESSED_DIR  : final fully processed bags (TF-corrected + range image)
 RAW_DIR=/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr22_raw
+TF_DIR=/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr22_tf_corrected
 PROCESSED_DIR=/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr22_processed
-RANGE_DIR=/media/aki/2C76C6780AEDB4DB/wl_wetlab_apr22_range
 CALIBRATION=~/auv_ws/src/sonar_camera_logger/config/microsoft_livecam_hd3000.yaml
 SCRIPTS=~/auv_ws/src/sonar_camera_logger/scripts
 
@@ -30,8 +33,8 @@ if [ -z "$BAG" ]; then
 fi
 
 RAW_BAG="$RAW_DIR/$BAG"
+TF_BAG="$TF_DIR/$BAG"
 PROCESSED_BAG="$PROCESSED_DIR/$BAG"
-RANGE_BAG="$RANGE_DIR/$BAG"
 RRD_FILE="$RRD_DIR/${BAG}.rrd"
 
 if [ ! -d "$RAW_BAG" ]; then
@@ -44,31 +47,31 @@ set +u
 source ~/auv_ws/install/setup.bash
 set -u
 
-mkdir -p "$PROCESSED_DIR" "$RANGE_DIR" "$RRD_DIR"
+mkdir -p "$TF_DIR" "$PROCESSED_DIR" "$RRD_DIR"
 
 # ── Step 1: Apply frame corrections ──────────────────────────────────────────
 echo ""
 echo "=== Step 1/3: Apply frame corrections ($BAG) ==="
-if [ -d "$PROCESSED_BAG" ]; then
-    echo "  Removing stale processed bag..."
-    rm -rf "$PROCESSED_BAG"
+if [ -d "$TF_BAG" ]; then
+    echo "  Removing stale TF-corrected bag..."
+    rm -rf "$TF_BAG"
 fi
 python3 "$SCRIPTS/apply_frame_corrections.py" \
     --bags_dir "$RAW_DIR" \
     --bag "$BAG" \
-    --output_dir "$PROCESSED_DIR" \
+    --output_dir "$TF_DIR" \
     --calibration "$CALIBRATION"
 
 # ── Step 2: Reconstruct range image ──────────────────────────────────────────
 echo ""
 echo "=== Step 2/3: Reconstruct range image ($BAG) ==="
-if [ -d "$RANGE_BAG" ]; then
-    echo "  Removing stale range bag..."
-    rm -rf "$RANGE_BAG"
+if [ -d "$PROCESSED_BAG" ]; then
+    echo "  Removing stale processed bag..."
+    rm -rf "$PROCESSED_BAG"
 fi
 python3 "$SCRIPTS/reconstruct_range_image.py" \
-    --bag "$PROCESSED_BAG" \
-    --output "$RANGE_BAG"
+    --bag "$TF_BAG" \
+    --output "$PROCESSED_BAG"
 
 # ── Step 3: Generate Rerun recording ─────────────────────────────────────────
 echo ""
@@ -78,7 +81,7 @@ if [ -f "$RRD_FILE" ]; then
     rm -f "$RRD_FILE"
 fi
 python3 "$SCRIPTS/visualize_bags_rerun.py" \
-    --bag "$RANGE_BAG" \
+    --bag "$PROCESSED_BAG" \
     --save "$RRD_FILE" \
     --every_nth 2 \
     --image_scale 0.5

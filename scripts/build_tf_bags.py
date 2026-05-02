@@ -8,7 +8,7 @@ same logic and rapid-rotation filter as aruco_tf_publisher.py.
 
 Outputs a new MCAP bag containing:
   • all original topics/messages copied verbatim
-  • /tf_static : world → sonar_tag  and  object_tag → object_center  (once, static)
+  • /tf_static : world → sonar_tag  and  object_tag → object_top  (once, static)
   • /tf        : sonar_tag → object_tag  (one message per valid /aruco/poses frame)
 
 After this, run visualize_bags_rerun.py --save to produce .rrd files:
@@ -22,7 +22,7 @@ After this, run visualize_bags_rerun.py --save to produce .rrd files:
 
 Physical frame offsets (must match aruco_tf_publisher / apply_frame_corrections):
     sonar_head  is  [0.00,  0.05, -0.70] m from sonar_tag  in tag frame
-    object_center is [0.00,  0.00, -0.15] m from object_tag in tag frame
+    object_top is [0.00,  0.00, -0.15] m from object_tag in tag frame
 
 Usage
 -----
@@ -46,7 +46,7 @@ import numpy as np
 # ── Physical offsets ──────────────────────────────────────────────────────────
 # sonar_head position in sonar_tag frame  →  world → sonar_tag = -offset
 SONAR_HEAD_OFFSET  = np.array([0.00,  0.05, -0.70])   # metres
-# object_center position in object_tag frame
+# object_top position in object_tag frame
 OBJECT_CTR_OFFSET  = np.array([0.00,  0.00, -0.15])   # metres
 
 POSES_TOPIC  = "/aruco/poses"
@@ -128,7 +128,7 @@ def build_static_tf_bytes(t_ns: int) -> bytes:
     """
     Two static transforms:
       world → sonar_tag     (sonar_head is the world origin)
-      object_tag → object_center
+      object_tag → object_top
     """
     from rclpy.serialization import serialize_message
 
@@ -139,9 +139,9 @@ def build_static_tf_bytes(t_ns: int) -> bytes:
         t_world_sonar_tag, identity_quat(), t_ns,
     )
 
-    # object_tag → object_center
+    # object_tag → object_top
     ts_ot_oc = make_transform_stamped(
-        "object_tag", "object_center",
+        "object_tag", "object_top",
         OBJECT_CTR_OFFSET, identity_quat(), t_ns,
     )
 

@@ -18,7 +18,7 @@ aruco_tf_publisher:
     sonar_aruco_offset_pitch_deg: 0.0
     sonar_aruco_offset_yaw_deg: 0.0
 
-    # ── Static: floater_aruco → object_center ────────────────────────────────
+    # ── Static: float_aruco → object_top ────────────────────────────────
     # Rigid offset from thed   floater ArUco marker centre to the centre of the object.
     # Measure these on data collection day and fill them in (metres / degrees).
     object_center_offset_x: 0.0

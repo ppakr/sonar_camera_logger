@@ -12,7 +12,7 @@ Logs per bag frame:
   aruco/sonar_head                — Corrected sonar transducer position + orientation axes (red)
   aruco/object_tag                — ArUco tag origin frame on the floater (light-green dot + axes)
   aruco/object_tag/offset_arrow   — Arrow from object tag → object centre (0.15 m)
-  aruco/object_center             — Corrected object centre position + orientation axes (green)
+  aruco/object_top             — Corrected object centre position + orientation axes (green)
   aruco/sonar_object_line         — Yellow line showing sonar-to-object distance
   metrics/sonar_object_distance   — Euclidean sonar-to-object distance over time (m)
 
@@ -41,7 +41,7 @@ Topics consumed
   /sonar_3d/strength_image        — Image mono8 (sonar strength bitmap)
   /sonar_3d/range_image           — Image 32FC1 (reconstructed range, metres)
   /aruco/image_debug              — Image (camera)
-  /tf_static                      — TFMessage  (world→sonar_tag, object_tag→object_center)
+  /tf_static                      — TFMessage  (world→sonar_tag, object_tag→object_top)
   /tf                             — TFMessage  (sonar_tag→object_tag, dynamic)
   /aruco/sonar_object_distance    — Float64  (-1 = not visible)
 """
@@ -84,8 +84,8 @@ TF_ENTITY_PATHS = {
     "world":          "frames/world",
     "sonar_link":     "frames/world/sonar_link",
     "sonar_aruco":    "frames/world/sonar_link/sonar_aruco",
-    "floater_aruco":  "frames/world/sonar_link/sonar_aruco/floater_aruco",
-    "object_center":  "frames/world/sonar_link/sonar_aruco/floater_aruco/object_center",
+    "float_aruco":  "frames/world/sonar_link/sonar_aruco/float_aruco",
+    "object_top":  "frames/world/sonar_link/sonar_aruco/float_aruco/object_top",
     # legacy names from earlier bags
     "sonar_tag":      "frames/world/sonar_tag",
     "object_tag":     "frames/world/sonar_tag/object_tag",
@@ -94,8 +94,8 @@ TF_AXIS_LENGTHS = {
     "world":          0.20,
     "sonar_link":     0.15,
     "sonar_aruco":    0.12,
-    "floater_aruco":  0.12,
-    "object_center":  0.08,
+    "float_aruco":  0.12,
+    "object_top":  0.08,
     "sonar_tag":      0.12,
     "object_tag":     0.12,
 }
@@ -103,8 +103,8 @@ TF_POINT_COLOURS = {
     "world":          [255, 220,  50, 255],   # yellow        — sonar head / world
     "sonar_link":     [255, 180,  20, 255],   # dark-yellow   — sonar transducer
     "sonar_aruco":    [255, 140,  60, 255],   # orange        — sonar ArUco tag
-    "floater_aruco":  [100, 220, 100, 255],   # lt-green      — floater ArUco tag
-    "object_center":  [ 50, 200,  50, 255],   # green         — object centre
+    "float_aruco":  [100, 220, 100, 255],   # lt-green      — floater ArUco tag
+    "object_top":  [ 50, 200,  50, 255],   # green         — object centre
     "sonar_tag":      [255, 140,  60, 255],
     "object_tag":     [100, 220, 100, 255],
 }
@@ -112,8 +112,8 @@ TF_POINT_RADII = {
     "world":          0.040,
     "sonar_link":     0.030,
     "sonar_aruco":    0.020,
-    "floater_aruco":  0.020,
-    "object_center":  0.030,
+    "float_aruco":  0.020,
+    "object_top":  0.030,
     "sonar_tag":      0.020,
     "object_tag":     0.020,
 }

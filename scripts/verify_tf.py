@@ -33,10 +33,10 @@ import numpy as np
 # Must match the values used when running apply_frame_corrections.py
 OFFSETS = {
     "sonar_head":    np.array([0.00,  0.05, -0.70]),
-    "object_center": np.array([0.00,  0.00, -0.15]),
+    "object_top": np.array([0.00,  0.00, -0.15]),
 }
-# Ordering in corrected_poses: [sonar_head, object_center]
-POSE_ORDER = ["sonar_head", "object_center"]
+# Ordering in corrected_poses: [sonar_head, object_top]
+POSE_ORDER = ["sonar_head", "object_top"]
 
 CALIB_PATH = (
     "/home/aki/auv_ws/src/sonar_camera_logger/config/calibration_parameters.yaml"
@@ -199,7 +199,7 @@ def verify_bag(bag_path: str, K: np.ndarray, n_frames: int, output_dir: str):
 
             COLORS = {
                 "sonar_head":    (80, 80, 255),   # red (BGR)
-                "object_center": (80, 200, 80),   # green (BGR)
+                "object_top": (80, 200, 80),   # green (BGR)
             }
             col = COLORS[label]
 
@@ -223,7 +223,7 @@ def verify_bag(bag_path: str, K: np.ndarray, n_frames: int, output_dir: str):
         # ── Verify distance consistency ───────────────────────────────────────
         if len(positions) == 2:
             _, _, p_s, _, _ = positions[0]   # sonar_head
-            _, _, p_o, _, _ = positions[1]   # object_center
+            _, _, p_o, _, _ = positions[1]   # object_top
             computed_dist = float(np.linalg.norm(p_s - p_o))
             print(f"    Distance check:")
             print(f"      Computed from positions : {computed_dist:.4f} m")

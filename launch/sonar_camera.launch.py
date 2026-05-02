@@ -31,8 +31,8 @@ def generate_launch_description():
             ),
             # ArUco TF publisher — publishes the full experiment TF tree:
             #   sonar_link → sonar_aruco  (static, fill offsets in aruco_tf_publisher.yaml)
-            #   sonar_aruco → floater_aruco  (dynamic, updated each frame)
-            #   floater_aruco → object_center  (static, fill offsets in aruco_tf_publisher.yaml)
+            #   sonar_aruco → float_aruco  (dynamic, updated each frame)
+            #   float_aruco → object_top  (static, fill offsets in aruco_tf_publisher.yaml)
             Node(
                 package="sonar_camera_logger",
                 executable="aruco_tf_publisher.py",

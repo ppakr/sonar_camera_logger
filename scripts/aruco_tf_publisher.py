@@ -6,8 +6,8 @@ Publishes the TF tree for the wet-lab sonar experiment:
 
     world ──(static, identity)──> sonar_link          published by sonar_driver.py
     sonar_link ──(static)──> sonar_aruco               rigid offset, measured on experiment day
-    sonar_aruco ──(dynamic)──> floater_aruco            computed each frame from camera detection
-    floater_aruco ──(static)──> object_center           rigid offset, measured on experiment day
+    sonar_aruco ──(dynamic)──> float_aruco            computed each frame from camera detection
+    float_aruco ──(static)──> object_top           rigid offset, measured on experiment day
 
 The dynamic transform is derived from /aruco/poses (PoseArray) and /aruco/ids
 by matching markers to their configured IDs (sonar_aruco_id, floater_aruco_id).
@@ -116,7 +116,7 @@ class ArucoTFPublisher(Node):
         self.declare_parameter("sonar_aruco_offset_pitch_deg", 0.0)
         self.declare_parameter("sonar_aruco_offset_yaw_deg", 0.0)
 
-        # Static offset: floater_aruco → object_center  (measure on experiment day)
+        # Static offset: float_aruco → object_top  (measure on experiment day)
         self.declare_parameter("object_center_offset_x", 0.0)
         self.declare_parameter("object_center_offset_y", 0.0)
         self.declare_parameter("object_center_offset_z", 0.0)
@@ -174,23 +174,23 @@ class ArucoTFPublisher(Node):
             qx, qy, qz, qw,
         )
 
-        # floater_aruco → object_center
+        # float_aruco → object_top
         qx, qy, qz, qw = rpy_to_quat(
             _rad("object_center_offset_roll_deg"),
             _rad("object_center_offset_pitch_deg"),
             _rad("object_center_offset_yaw_deg"),
         )
-        object_center_tf = make_static_tf(
-            "floater_aruco", "object_center",
+        object_top_tf = make_static_tf(
+            "float_aruco", "object_top",
             _val("object_center_offset_x"),
             _val("object_center_offset_y"),
             _val("object_center_offset_z"),
             qx, qy, qz, qw,
         )
 
-        self._static_broadcaster.sendTransform([sonar_aruco_tf, object_center_tf])
+        self._static_broadcaster.sendTransform([sonar_aruco_tf, object_top_tf])
         self.get_logger().info(
-            "Published static TFs: sonar_link → sonar_aruco, floater_aruco → object_center"
+            "Published static TFs: sonar_link → sonar_aruco, float_aruco → object_top"
         )
 
     # ── Callbacks ─────────────────────────────────────────────────────────────
@@ -223,7 +223,7 @@ class ArucoTFPublisher(Node):
         t_sonar = np.array([p_sonar.position.x, p_sonar.position.y, p_sonar.position.z])
         t_floater = np.array([p_floater.position.x, p_floater.position.y, p_floater.position.z])
 
-        # T_sonar_aruco_floater_aruco = T_cam_sonar_aruco^{-1} * T_cam_floater_aruco
+        # T_sonar_aruco_float_aruco = T_cam_sonar_aruco^{-1} * T_cam_float_aruco
         R_rel = R_sonar.T @ R_floater
         t_rel = R_sonar.T @ (t_floater - t_sonar)
 
@@ -243,7 +243,7 @@ class ArucoTFPublisher(Node):
         ts = TransformStamped()
         ts.header.stamp = msg.header.stamp
         ts.header.frame_id = "sonar_aruco"
-        ts.child_frame_id = "floater_aruco"
+        ts.child_frame_id = "float_aruco"
         ts.transform.translation.x = float(t_rel[0])
         ts.transform.translation.y = float(t_rel[1])
         ts.transform.translation.z = float(t_rel[2])
